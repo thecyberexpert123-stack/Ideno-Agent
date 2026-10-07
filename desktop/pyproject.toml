@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ideno-desktop"
-version = "0.2.0"
+version = "0.3.0"
 description = "Linux desktop host for Ideno: a Python window, a web engine, and file-backed storage for the Ideno web app."
 readme = "README.md"
 requires-python = ">=3.9"

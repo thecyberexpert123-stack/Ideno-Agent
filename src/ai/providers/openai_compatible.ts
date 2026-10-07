@@ -16,6 +16,7 @@
  *    be sent to a local model server but never over the open internet.
  *  - The key is never written to logs, errors, or the DOM.
  */
+import { DISCOVERY_TIMEOUT_MS, discoverModels, type DiscoveryFetch } from '../discovery.js';
 import { AIError, toAIError } from '../errors.js';
 import type {
   AIProvider,
@@ -57,6 +58,15 @@ export class OpenAICompatibleProvider implements AIProvider {
   readonly label = 'OpenAI-compatible endpoint';
 
   #config: OpenAICompatibleConfig;
+  /**
+   * Whether the last `listModels()` actually enumerated the endpoint.
+   *
+   * Tracked because `capabilities().model_catalog` should report what this endpoint
+   * does, not what the protocol allows in principle. It starts false and is only ever
+   * set by a successful discovery, so a UI can tell "here are your models" apart from
+   * "here is the one you typed".
+   */
+  #modelCatalog = false;
 
   constructor(config: OpenAICompatibleConfig) {
     this.#config = config;
@@ -77,7 +87,7 @@ export class OpenAICompatibleProvider implements AIProvider {
     return {
       json_mode: this.#config.json_mode === true,
       streaming: false,
-      model_catalog: false,
+      model_catalog: this.#modelCatalog,
       tools: false,
       max_output_tokens: true,
     };
@@ -90,11 +100,29 @@ export class OpenAICompatibleProvider implements AIProvider {
   }
 
   async listModels(): Promise<ModelInfo[]> {
-    // No portable way to enumerate models across OpenAI-compatible servers
-    // (some expose /models, many do not). Report the configured model instead of
-    // guessing or failing.
     const validation = validateConfig(this.#config);
     if (!validation.ok) return [];
+
+    // Ask the endpoint rather than guessing. Enumeration is not portable across
+    // OpenAI-compatible servers — some expose /models, many do not — so a failure here
+    // is ordinary and falls back to the configured model instead of reporting the
+    // endpoint as broken.
+    const discovered = await discoverModels(
+      {
+        base_url: this.#config.base_url,
+        api_key: this.#config.api_key ?? null,
+        timeout_ms: DISCOVERY_TIMEOUT_MS,
+        ...(this.#config.fetch_impl
+          ? { fetch_impl: this.#config.fetch_impl as unknown as DiscoveryFetch }
+          : {}),
+      },
+    );
+    if (discovered.ok && discovered.models.length > 0) {
+      this.#modelCatalog = true;
+      return discovered.models;
+    }
+
+    this.#modelCatalog = false;
     return [{ id: this.#config.model, label: this.#config.model }];
   }
 
@@ -187,15 +215,34 @@ export function completionsUrl(baseUrl: string): string {
 export type ConfigValidation = { ok: true } | { ok: false; reason: string };
 
 export function validateConfig(config: OpenAICompatibleConfig): ConfigValidation {
-  const raw = config.base_url?.trim();
-  if (!raw) return { ok: false, reason: 'Set the endpoint base URL in Settings (for example https://api.openai.com/v1).' };
+  const base = validateBaseUrl(config.base_url);
+  if (!base.ok) return base;
   if (!config.model?.trim()) return { ok: false, reason: 'Set a model id in Settings.' };
+  return { ok: true };
+}
+
+/**
+ * Validates a base URL on its own, without requiring a model.
+ *
+ * Split out from `validateConfig` because discovery needs it and must not inherit the
+ * model requirement: listing an endpoint's models is exactly what somebody does *before*
+ * they know which model to name. Requiring a model to discover models would be circular.
+ *
+ * The security rule lives here and only here, so completion and discovery cannot drift
+ * apart on it: plain `http://` is accepted for loopback hosts only, which lets a key
+ * reach a local model server but never the open internet.
+ */
+export function validateBaseUrl(raw: string | undefined | null): ConfigValidation {
+  const trimmed = raw?.trim();
+  if (!trimmed) {
+    return { ok: false, reason: 'Set the endpoint base URL in Settings (for example https://api.openai.com/v1).' };
+  }
 
   let url: URL;
   try {
-    url = new URL(raw);
+    url = new URL(trimmed);
   } catch {
-    return { ok: false, reason: `"${raw}" is not a valid URL.` };
+    return { ok: false, reason: `"${trimmed}" is not a valid URL.` };
   }
   if (url.protocol !== 'https:' && url.protocol !== 'http:') {
     return { ok: false, reason: 'The base URL must use http or https.' };

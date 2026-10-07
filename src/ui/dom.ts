@@ -19,6 +19,13 @@ export interface ElProps {
   text?: string;
   title?: string;
   disabled?: boolean;
+  /**
+   * Initial checked state for a checkbox or radio.
+   *
+   * Without this, a component has to find its own inputs after building and set them by
+   * position — which silently breaks the moment another checkbox is added above them.
+   */
+  checked?: boolean;
   value?: string;
   type?: string;
   placeholder?: string;
@@ -51,6 +58,9 @@ export function el<K extends keyof HTMLElementTagNameMap>(
     if (props.disabled !== undefined) {
       node.toggleAttribute('disabled', props.disabled);
       if (props.disabled) node.setAttribute('aria-disabled', 'true');
+    }
+    if (props.checked !== undefined && 'checked' in node) {
+      (node as HTMLInputElement).checked = props.checked;
     }
     if (props.href !== undefined) node.setAttribute('href', props.href);
     if (props.role !== undefined) node.setAttribute('role', props.role);

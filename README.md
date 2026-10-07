@@ -89,12 +89,34 @@ disk, where the limit is the filesystem's.
 | Provider | What you need | Notes |
 | --- | --- | --- |
 | **Puter.js** (default) | A free Puter account, signed in from the browser | No API key in this codebase. Puter's user-pays model bills your Puter account. The SDK lives in its own chunk and is fetched only while Puter is the selected provider — which, being the default, means on first load. |
-| **OpenAI-compatible** | A base URL and (usually) an API key | Works with OpenAI, OpenRouter, Azure OpenAI, vLLM, llama.cpp, LM Studio, Ollama's OpenAI endpoint. |
+| **OpenAI-compatible** | A base URL and a model id. **The API key is optional.** | Works with OpenAI, OpenRouter, Azure OpenAI, vLLM, llama.cpp, LM Studio, Ollama's OpenAI endpoint. With no key, no `Authorization` header is sent — which is what a local server wants. |
 | **Scripted demo** | Nothing | Replays the fixed scenario. Never calls a model. |
+
+**Several custom agents at once.** An "agent" is a named profile — base URL, model
+id, optional key — so "my local Ollama", "the team's vLLM box" and "OpenRouter"
+can all be configured and switched between without re-typing anything. Up to 12
+profiles; each remembers its own key only if you tick *Remember this key*, and
+turning that off deletes it.
+
+**Verify an endpoint before trusting it.** Two buttons, because they answer
+different questions:
+
+- **Find models** — `GET {base_url}/models`, costs nothing, needs no model chosen.
+  This is what confirms the base URL and key are accepted, and lets you pick a
+  real model id from a list instead of guessing one. Understands the OpenAI
+  `{data:[{id}]}` shape, Ollama's `{models:[{name}]}`, and bare arrays. If a
+  server does not implement `/models` at all — common — it says so and tells you
+  to type the model id by hand, rather than implying your configuration is wrong.
+- **Send a test message** — one real completion, which also confirms the model id
+  is valid. The UI says plainly that this spends a request on that account.
+
+Both work on a profile you have not saved yet, so you do not have to commit a
+wrong configuration to discover that it is wrong.
 
 Adding a provider means adding one file in `src/ai/providers/` that satisfies
 `AIProvider`, one case in `src/ai/factory.ts`, and one entry in `ProviderIdSchema`.
-Ideno Core contains no provider-specific logic.
+Ideno Core contains no provider-specific logic. Custom agents are *not* a new
+provider — they are profiles on `openai_compatible`, so there is one code path.
 
 ---
 
@@ -163,10 +185,13 @@ src/
 │   ├── provider_interface/  AIProvider, ChatTurn, capabilities
 │   ├── runtime/             validation, JSON extraction, timeout, repair
 │   ├── providers/           puter · openai_compatible · scripted
-│   ├── settings.ts          provider ids and endpoint configuration
+│   ├── settings.ts          provider ids, agent profiles, endpoint configuration
+│   ├── settings_store.ts    load/save, secrets, legacy migration
+│   ├── discovery.ts         GET /models and the live test completion
 │   └── factory.ts           the only place that knows providers exist
 ├── reasoning/               prompts, structured context, operation preparation
 ├── research/                evidence, sources, gap analysis
+│   └── sources/             wikipedia · puter_web_search · tavily
 ├── render/                  Idea State → renderer-independent CanonicalScene
 ├── plugins/                 extension points + the Three.js renderer plugin
 ├── ui/                      DOM builder, components, app shell
@@ -230,7 +255,19 @@ nonexistent object) rather than hiding it.
   root. See [`desktop/README.md`](desktop/README.md).
 - **Research sends your question to a third party, and Settings says so.** Wikipedia
   lookups go to `en.wikipedia.org` anonymously (`origin=*`, no account, no key); Puter
-  web search goes through your Puter account. Both are switchable.
+  web search goes through your Puter account; Tavily goes to `api.tavily.com` with your
+  Tavily key and **bills your account per search**. All three are switchable, and each
+  states its own cost next to its toggle.
+- **Keys are never persisted unless you opt in, per key.** An agent key or the Tavily
+  key is held in memory by default. Ticking *Remember this key* stores it in browser
+  storage, and Settings says what that means: readable by every script on this origin.
+  Unticking it deletes it on the next save. In the desktop app the Tavily key can be
+  supplied as `TAVILY_API_KEY` in the environment instead, keeping it out of the
+  browser entirely.
+- **The desktop bridge is not a proxy.** `web_search` accepts a query and bounded
+  options, never a URL; the Tavily endpoint is a constant in the host, not caller
+  input. A compromised page can spend search credits, but cannot point the host at an
+  arbitrary address.
 - Model output is validated before it touches the state, ids are minted by Core,
   references that do not resolve are pruned, and claims of evidence that cite
   nothing are downgraded — with a note.
@@ -248,9 +285,10 @@ whether an extension point was worth having.
 
 **Known limitations, stated plainly:**
 
-- **Automated research is gated on citations, and will often return nothing.** Two
-  sources ship — Wikipedia (on by default) and Puter web search (off by default,
-  OpenAI-routed models only). Neither records a finding without a title and a link
+- **Automated research is gated on citations, and will often return nothing.** Three
+  sources ship — Wikipedia (on by default), Puter web search (off by default,
+  OpenAI-routed models only) and Tavily (off by default, needs a Tavily API key).
+  None records a finding without a title and a link
   you can follow, and Puter web search additionally requires a citation whose
   `start_index`/`end_index` span actually appears in the answer. Community reports
   say that annotation array is frequently empty, so the honest outcome is often zero

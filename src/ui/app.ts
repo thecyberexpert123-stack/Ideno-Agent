@@ -19,10 +19,17 @@ import {
   type TranscriptEntry,
 } from '../core/schemas/index.js';
 import { SettingsSchema, type Settings } from '../ai/settings.js';
-import { loadSettings, saveSettings } from '../ai/settings_store.js';
+import { loadSettings, saveSettings, type SettingsSecrets } from '../ai/settings_store.js';
+import { activeAgent } from '../ai/settings.js';
+import { discoverModels, probeAgent } from '../ai/discovery.js';
 import { StateManager, type StateEvent } from '../core/state_manager/state_manager.js';
 import { createDefaultStore, type Store } from '../core/state_manager/store.js';
-import { initDesktopStore, type DesktopHost, type DesktopStore } from './desktop_bridge.js';
+import {
+  createDesktopTavilyTransport,
+  initDesktopStore,
+  type DesktopHost,
+  type DesktopStore,
+} from './desktop_bridge.js';
 import { Orchestrator, type OrchestratorEvent } from '../core/orchestrator/orchestrator.js';
 import { applySettings, createAIRuntime, syncResearchSources, type ProviderBundle } from '../ai/factory.js';
 import type { ModelInfo, ProviderAvailability } from '../ai/provider_interface/provider.js';
@@ -42,7 +49,7 @@ import {
 import { renderVersions, type VersionViewState } from './components/versions.js';
 import { renderWorkspaceModal } from './components/workspace.js';
 import { renderSpec, type SpecViewer } from './components/spec.js';
-import { PROVIDER_LABELS, renderSettingsModal } from './components/settings.js';
+import { PROVIDER_LABELS, renderSettingsModal, type AgentCheckState } from './components/settings.js';
 
 /**
  * How long a burst of mutations is collected into one write.
@@ -73,6 +80,23 @@ export class IdenoApp {
   #desktopStore: DesktopStore | null = null;
   #settings: Settings;
   #apiKey: string | null;
+  /** Keys for each custom agent profile, by id. In memory unless persistence was opted into. */
+  #agentApiKeys: Record<string, string> = {};
+  #tavilyApiKey: string | null = null;
+  /** Result of the last agent discovery or probe, shown in Settings. */
+  #agentCheck: AgentCheckState | null = null;
+  /**
+   * Unsaved Settings edits, kept across a re-render.
+   *
+   * Discovery and probing re-render the modal, and the modal rebuilds its draft from
+   * what it is given. Without this, testing a base URL you had just typed would discard
+   * it — the field would come back empty and the result would refer to nothing.
+   */
+  #settingsDraft: {
+    settings: Settings;
+    agentApiKeys: Record<string, string>;
+    tavilyApiKey: string | null;
+  } | null = null;
   #state: StateManager;
   #research = new ResearchRegistry();
   #plugins: PluginRegistry;
@@ -138,6 +162,8 @@ export class IdenoApp {
     const loaded = loadSettings(this.#store);
     this.#settings = loaded.settings;
     this.#apiKey = loaded.apiKey;
+    this.#agentApiKeys = loaded.agentApiKeys;
+    this.#tavilyApiKey = loaded.tavilyApiKey;
     if (loaded.warning) this.#notice = loaded.warning;
 
     this.#state = new StateManager({
@@ -157,6 +183,7 @@ export class IdenoApp {
     this.#plugins.register(createThreePlugin());
     this.#bundle = createAIRuntime(this.#settings, {
       scripted: { responses: greenhouseResponder(this.#state) },
+      agentApiKey: this.#activeAgentKey(),
     });
     this.#orchestrator = new Orchestrator({
       runtime: this.#bundle.runtime,
@@ -223,8 +250,10 @@ export class IdenoApp {
     const loaded = loadSettings(desktop);
     this.#settings = loaded.settings;
     this.#apiKey = loaded.apiKey;
+    this.#agentApiKeys = loaded.agentApiKeys;
+    this.#tavilyApiKey = loaded.tavilyApiKey;
     if (loaded.warning) this.#notice = loaded.warning;
-    applySettings(this.#bundle, this.#settings, this.#apiKey);
+    applySettings(this.#bundle, this.#settings, this.#activeAgentKey());
     // The constructor registered sources from the *default* settings, because on the
     // desktop the real ones are not readable until now. Without this a user who
     // switched Wikipedia off would have it consulted anyway until they next opened
@@ -626,7 +655,33 @@ export class IdenoApp {
    * is what keeps it that way.
    */
   #syncResearchSources(): void {
-    syncResearchSources(this.#research, this.#settings);
+    // The desktop host gets first refusal on Tavily: it has no cross-origin restriction,
+    // so a browser that would block the call still gets results. `createDesktopTavilyTransport`
+    // returns null when the host does not offer it, and the source falls back to a direct
+    // request that reports a blocked call as such.
+    const transport = this.#desktopHost ? createDesktopTavilyTransport(this.#desktopHost) : null;
+    syncResearchSources(this.#research, this.#settings, {
+      tavilyApiKey: this.#tavilyApiKey,
+      ...(transport ? { tavilyTransport: transport } : {}),
+    });
+  }
+
+  /** The key belonging to whichever agent profile is currently selected. */
+  #activeAgentKey(): string | null {
+    const agent = activeAgent(this.#settings);
+    return agent ? this.#agentApiKeys[agent.id] ?? null : this.#apiKey;
+  }
+
+  /** Turns the modal's secrets into the resolved form the app holds. */
+  #resolveSecrets(secrets: SettingsSecrets): {
+    agentApiKeys: Record<string, string>;
+    tavilyApiKey: string | null;
+  } {
+    const agentApiKeys: Record<string, string> = {};
+    for (const [id, value] of Object.entries(secrets.agentApiKeys ?? {})) {
+      if (typeof value === 'string' && value.length > 0) agentApiKeys[id] = value;
+    }
+    return { agentApiKeys, tavilyApiKey: secrets.tavilyApiKey ?? null };
   }
 
   /** What the Spec panel needs to offer and host the 3D view. */
@@ -729,19 +784,28 @@ export class IdenoApp {
     render(
       this.#modalHost,
       renderSettingsModal({
-        settings: this.#settings,
+        settings: this.#settingsDraft?.settings ?? this.#settings,
         apiKey: this.#apiKey,
+        agentApiKeys: this.#settingsDraft?.agentApiKeys ?? this.#agentApiKeys,
+        tavilyApiKey: this.#settingsDraft?.tavilyApiKey ?? this.#tavilyApiKey,
         availability: this.#availability,
         providerLabel: PROVIDER_LABELS[this.#settings.provider_id],
         models: this.#models,
+        agentCheck: this.#agentCheck,
         notice: this.#storageWarning,
         onClose: () => {
           this.#settingsOpen = false;
+          // Discarded on close: an abandoned edit is not a saved one, and keeping it
+          // would silently resurrect a half-finished agent the next time Settings opened.
+          this.#settingsDraft = null;
+          this.#agentCheck = null;
           this.#renderModal();
         },
         onSignIn: () => void this.#signIn(),
         onRefreshModels: () => void this.#refreshModels(),
-        onSave: (settings, apiKey) => this.#saveSettings(settings, apiKey),
+        onDiscoverAgent: (draft, secrets, agentId) => void this.#discoverAgent(draft, secrets, agentId),
+        onProbeAgent: (draft, secrets, agentId) => void this.#probeAgent(draft, secrets, agentId),
+        onSave: (settings, secrets) => this.#saveSettings(settings, secrets),
       }),
     );
   }
@@ -1101,23 +1165,108 @@ export class IdenoApp {
 
   #openSettings(): void {
     this.#settingsOpen = true;
+    // A fresh open starts from saved settings, not from whatever was abandoned last time.
+    this.#settingsDraft = null;
+    this.#agentCheck = null;
     this.#renderModal();
     void this.#refreshProvider();
   }
 
-  #saveSettings(settings: Settings, apiKey: string | null): void {
+  #saveSettings(settings: Settings, secrets: SettingsSecrets): void {
     this.#settings = settings;
-    this.#apiKey = apiKey;
-    const saved = saveSettings(this.#store, settings, apiKey);
+    const resolved = this.#resolveSecrets(secrets);
+    this.#agentApiKeys = resolved.agentApiKeys;
+    this.#tavilyApiKey = resolved.tavilyApiKey;
+    this.#apiKey = this.#activeAgentKeyFor(settings, resolved.agentApiKeys);
+
+    const saved = saveSettings(this.#store, settings, secrets);
     if (!saved.saved) {
       this.#notice = saved.reason ?? 'Settings could not be saved.';
     }
-    applySettings(this.#bundle, settings, apiKey);
+    applySettings(this.#bundle, settings, this.#apiKey);
     this.#syncResearchSources();
     this.#models = [];
     this.#settingsOpen = false;
+    this.#settingsDraft = null;
+    this.#agentCheck = null;
     this.#render();
     void this.#refreshProvider();
+  }
+
+  #activeAgentKeyFor(settings: Settings, agentApiKeys: Record<string, string>): string | null {
+    const agent = activeAgent(settings);
+    return agent ? agentApiKeys[agent.id] ?? null : null;
+  }
+
+  /**
+   * Asks an endpoint what models it serves.
+   *
+   * Runs against the draft, not the saved settings, so an agent can be checked before it
+   * exists — which is the only order that makes sense when setting one up.
+   */
+  async #discoverAgent(draft: Settings, secrets: SettingsSecrets, agentId: string): Promise<void> {
+    const resolved = this.#resolveSecrets(secrets);
+    this.#settingsDraft = { settings: draft, ...resolved };
+    const agent = draft.agents.find((candidate) => candidate.id === agentId);
+    if (!agent) return;
+
+    this.#agentCheck = { agentId, kind: 'discover', busy: true, ok: false, models: [], message: '' };
+    this.#renderModal();
+
+    const result = await discoverModels({
+      base_url: agent.base_url,
+      api_key: resolved.agentApiKeys[agentId] ?? null,
+      timeout_ms: this.#settings.timeout_ms,
+    });
+    // Ignored if the modal closed while the request was in flight: writing a result for
+    // a panel nobody is looking at would resurrect it on the next open.
+    if (!this.#settingsOpen) return;
+    this.#agentCheck = {
+      agentId,
+      kind: 'discover',
+      busy: false,
+      ok: result.ok,
+      models: result.models,
+      message: result.ok ? '' : result.reason ?? 'That endpoint did not return a model list.',
+    };
+    this.#renderModal();
+  }
+
+  /**
+   * Sends one real completion to prove the agent answers.
+   *
+   * Separate from discovery because it spends a request on the user's account, and
+   * something that costs money must be an explicit action rather than a side effect of
+   * opening a panel.
+   */
+  async #probeAgent(draft: Settings, secrets: SettingsSecrets, agentId: string): Promise<void> {
+    const resolved = this.#resolveSecrets(secrets);
+    this.#settingsDraft = { settings: draft, ...resolved };
+    const agent = draft.agents.find((candidate) => candidate.id === agentId);
+    if (!agent) return;
+
+    this.#agentCheck = { agentId, kind: 'probe', busy: true, ok: false, models: [], message: '' };
+    this.#renderModal();
+
+    const result = await probeAgent({
+      base_url: agent.base_url,
+      model: agent.model,
+      api_key: resolved.agentApiKeys[agentId] ?? null,
+      timeout_ms: this.#settings.timeout_ms,
+    });
+    if (!this.#settingsOpen) return;
+    this.#agentCheck = {
+      agentId,
+      kind: 'probe',
+      busy: false,
+      ok: result.ok,
+      models: [],
+      message: result.ok ? '' : result.reason ?? 'The test message did not get an answer.',
+      ...(result.model ? { model: result.model } : {}),
+      ...(result.reply ? { reply: result.reply } : {}),
+      ...(typeof result.latency_ms === 'number' ? { latencyMs: result.latency_ms } : {}),
+    };
+    this.#renderModal();
   }
 
   async #refreshProvider(): Promise<void> {

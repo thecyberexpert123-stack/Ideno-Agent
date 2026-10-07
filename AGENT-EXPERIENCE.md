@@ -481,3 +481,164 @@ Two practical consequences worth passing on:
 Also: vitest's default 5 s timeout kills performance probes (raise it explicitly for
 those), `pkill -f` can kill its own shell, and `python3 -m pip install --user` is
 blocked by PEP 668 here — use a venv.
+
+---
+
+# v0.3 — custom agents, discovery, and Tavily
+
+## 21. The tests found a defect I would have shipped
+
+`discoverModels` handled a failed `GET /models` by falling through to a generic
+`statusReason` message. A 404 therefore read as *"that endpoint returned HTTP 404"* —
+which, to a user who has just typed a base URL and a key, means **your configuration is
+wrong**.
+
+It usually is not. Plenty of OpenAI-compatible servers simply do not implement
+`/models` at all. The correct base URL and the correct key produce a 404 on that one
+path, and the honest advice is "type the model id by hand", not "check your settings".
+
+I did not find this by reading the code. I found it by writing
+`tests/custom_agents.test.ts` and reading the message the test produced. That is the
+whole argument for writing the failure-path tests before declaring a feature done: the
+defect was in the *wording*, and wording is exactly what a happy-path test never looks
+at. The fix added `status?: number` to `DiscoveryResult` so the UI can tell 401/403
+(rejected your credentials), 404/405 (no model list, not your fault) and no-status
+(unreachable) apart — three situations needing three different pieces of advice.
+
+## 22. Two fetch seams, and why I did not unify them
+
+The provider's `FetchLike` declares `body: string` as **required**. Real `fetch`
+*throws* if you pass a body on a GET (`Request with GET/HEAD method cannot have body`),
+so `GET {base_url}/models` cannot use that seam unchanged.
+
+The tempting fix is to widen `FetchLike` to `body?: string`. It is backwards compatible
+for every existing caller, so it passes review easily. But it would have removed a
+guarantee the provider actually depends on: *every completion it sends has a body*.
+Weakening a seam to avoid writing a second one is how seams stop meaning anything.
+
+So there are two, deliberately, each saying something true about its caller:
+
+- `DiscoveryFetch` — `body?` optional, because discovery issues a GET and a POST;
+- `FetchLike` — `body` required, because completions always have one.
+
+The cost is one small adapter in the tests (`asProviderFetch`) at the boundary where the
+provider's seam is stricter. That is a fair price: the awkwardness lives in test code,
+once, and is documented, instead of being a silent loosening in production types.
+
+## 23. Discovery had to work on a profile that is not saved
+
+This shaped the module more than anything else. If discovery lived inside the provider,
+the only way to check a base URL would be to **save it first** — so a user would have to
+commit a configuration they suspect is broken in order to learn whether it is. That is
+backwards, and it is the kind of thing that feels fine in a design doc and awful in use.
+
+`discovery.ts` is therefore standalone and takes a profile, not a provider. `app.ts`
+keeps a `#settingsDraft`, hands it to discovery, and re-renders from the result. One
+consequence needed care: an in-flight discovery can outlive the modal, so the callback
+re-checks `#settingsOpen` and bails if the user closed it, rather than re-rendering a
+modal that is gone.
+
+## 24. Migration must not widen a security decision
+
+`migrateSettings` moves the legacy `settings.openai` object into `agents[0]`. The
+tempting version also moves `openai_api_key` into `agent_api_keys[id]` unconditionally,
+because otherwise the user's key appears to vanish during an upgrade — and a vanishing
+key looks like data loss.
+
+But the new schema has `persist_api_key` per profile, and a user who had *chosen* not to
+persist would find their key persisted after all, by a migration they never asked for.
+Quietly converting "keep this in memory" into "write this to storage" is the worse
+failure. So the key is carried over **only if** that profile had `persist_api_key` set.
+Migration preserves the decision, not just the data.
+
+Related, and caught during self-review before it shipped: destructuring
+`persist_tavily_api_key` out of a `rest` object in `settings_store.ts` silently reset the
+preference on every load. The field had to be read off the settings value, and the
+persisted schema had to carry it. Destructuring a preference away and then re-saving
+without it is a very easy bug to write and a very hard one to notice, because nothing
+errors — the setting just never sticks.
+
+## 25. An optional bridge method beat a protocol bump
+
+`DesktopApi.web_search` is **absent from `REQUIRED_METHODS`**, and `PROTOCOL_VERSION`
+stays at 1. `createDesktopTavilyTransport` returns `null` when the method is missing and
+the caller falls back to browser-direct.
+
+The alternative — bump the protocol and require the method — is cleaner on paper and
+worse in fact: it would make every existing desktop host **refuse to start** after an app
+update, for a feature that is off by default. Compatibility is worth one null check.
+
+The bridge has no abort support, so cancellation and timeout are enforced locally in
+`raceAbort` — settle on the earlier of the bridge result and a timer, and *discard* a late
+result rather than applying it. Without the discard, a search that timed out could still
+write findings into the panel afterwards, which reads as the UI changing by itself.
+
+## 26. Not a proxy: the narrowing that made the bridge safe
+
+A generic "fetch this URL for me" bridge method would have been fewer lines and would have
+turned the Python host into an **open proxy** running with the user's network position and
+environment. A compromised or merely buggy page could then reach internal services the
+browser itself could not — which is the whole reason the loopback-only static server
+re-checks every path.
+
+`web_search` therefore accepts a query and bounded options, and **never a URL**.
+`TAVILY_URL` is a module constant. The worst a hostile page can do is spend search
+credits. `test_websearch.py` asserts this directly rather than leaving it to review: a
+payload carrying `url` and `endpoint` keys is still sent to `TAVILY_URL`.
+
+Python also reads the key from the payload **or** from `TAVILY_API_KEY` in the
+environment, so a user can keep the secret out of the browser entirely. That is the
+strongest position available here, and it is only reachable because the host, not the
+page, owns the call.
+
+## 27. Test bugs are still bugs, and three of mine were instructive
+
+`tests/settings_ui.test.ts` failed four times before it passed, and every failure was in
+the test — but each one was a real lesson about asserting on a DOM:
+
+- **`querySelector('select')` found the provider picker, not the agent picker**, because
+  the provider select comes first in the modal. Changing it to `'b'` did nothing and the
+  test looked like a product bug. Selecting by *what an element offers* (an option whose
+  value is `b`) rather than by position is the only robust form.
+- **`inputsIn(root, 'text')[0]` was the workspace-name field**, not the agent name. Same
+  mistake, different element. Scoping to the agent section container fixed it.
+- **A `/Tavily/` label filter matched four checkboxes, not three**, because the Tavily
+  *key-persistence* checkbox also names Tavily. Matching on the toggles' own leading
+  wording fixed it.
+- **The agent editor is `hidden`, not absent**, for another provider — consistent with how
+  the modal already treats the Puter and OpenAI-compatible fields. My first test asserted
+  absence and was wrong about the design, not about the code. `hidden` is `display:none`
+  and out of the accessibility tree, so "a user does not see it" is satisfied; asserting
+  on the `hidden` property states the actual requirement.
+
+The pattern across all four: **positional and substring selectors on a form encode
+assumptions about layout that the component never promised.** Scope by label or by
+container, and assert on the property that carries the requirement.
+
+## 28. What v0.3 did not verify
+
+- **Whether Tavily permits browser-side (CORS) calls is UNVERIFIED.** `api.tavily.com` is
+  unreachable from this sandbox (`curl` → `connect=000`) and an `OPTIONS` probe returned
+  no CORS headers at all — consistent with both "blocked" and "never got through". No
+  documentation or search result states the policy, every documented example is
+  server-side, and the official JS SDK is `require("@tavily/core")`, a Node package.
+  **The desktop path is the one to rely on.** Worth knowing when debugging: a CORS block
+  surfaces as `TypeError` / "Failed to fetch" **with no status code**, indistinguishable
+  from a dead network — unlike 401 or 429, which are reported specifically. If Tavily
+  returns nothing in a browser but works from the desktop app, suspect CORS before the key.
+- **No live Tavily call was made**, from TypeScript or from Python. Both are verified
+  against an injected transport and a stubbed `urlopen`, exactly as `WikipediaSource` is.
+- **No live `GET /models`** against a real OpenAI-compatible server. All three response
+  shapes (`{data:[{id}]}`, Ollama's `{models:[{name}]}`, bare arrays) are tested against
+  an injected `DiscoveryFetch`.
+- **The Settings UI was never exercised in a browser engine.** 38 jsdom tests cover the
+  real component's logic and rendering, not layout, focus order, or engine behaviour.
+- Everything §19 listed still stands: no real browser, no WebGL frames, no Puter sign-in
+  popup, no browser-native quota behaviour, no observed pywebview window.
+
+One open question was **deliberately left undecided** rather than resolved for
+convenience: plain `http` is still blocked for non-loopback hosts, so a keyless LAN
+endpoint (`http://192.168.1.5:11434/v1`) is rejected even though it would work. Allowing
+it is a real security relaxation — idea content would travel in plaintext on that network
+— so it is recorded in `docs/ARCHITECTURE.md` §"Still open after v0.3" as a decision for
+the user, with the warning it would need in the UI. Not deciding was the correct move.

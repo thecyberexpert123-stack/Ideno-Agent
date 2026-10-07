@@ -4,6 +4,173 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses
 semantic versioning.
 
+## 0.3.0 — 2026-10-07
+
+Three capabilities, requested together: **several custom agents configured by
+base URL and/or API key**, **a way to verify an endpoint before trusting it**,
+and **Tavily web search as a real `ResearchSource`**.
+
+All three reuse what already exists rather than adding a parallel path: custom
+agents are profiles on the existing `openai_compatible` provider, discovery is a
+module of its own so an *unsaved* profile can be checked, and Tavily is a fourth
+research source behind the same citation-integrity gate as the other three.
+
+### Added — custom agent profiles
+
+- **`settings.agents[]`** — up to `MAX_AGENT_PROFILES = 12` profiles, each
+  `{ id, name, base_url, model, json_mode, persist_api_key }`, with
+  `settings.active_agent_id` selecting one. Profiles are a user-visible concept:
+  "my local Ollama", "the team's vLLM box", "OpenRouter".
+- **The API key is genuinely optional.** `validateConfig` requires `base_url` and
+  `model` but not a key, and `Authorization` is sent **only** when a key is
+  non-empty. A keyless local server (`http://127.0.0.1:11434/v1`) works; nothing
+  is fabricated to fill the gap.
+- **Per-agent keys** (`agent_api_keys`, keyed by profile id) instead of one
+  `openai_api_key`. Saving merges with what is already stored, so a partial save
+  cannot erase another agent's key; keys whose profile has
+  `persist_api_key: false` are stripped on save rather than left behind.
+- **Migration** (`migrateSettings`) carries the legacy `openai` object into
+  `agents[0]` once, idempotently, and then clears it. The legacy key is moved
+  into `agent_api_keys[id]` **only if** that profile had `persist_api_key` set —
+  migration never silently widens a security decision the user already made.
+- **Settings UI**: an agent picker, name, base URL, model (select-or-type),
+  optional key, JSON-mode and persistence toggles, plus add/remove. Saving is
+  refused with an actionable message when a profile has no base URL; removing the
+  last profile is refused so the provider is never left unconfigurable.
+
+### Added — endpoint discovery and a live probe
+
+Two separate actions, because they answer different questions and one of them
+costs money:
+
+- **`discoverModels`** (`src/ai/discovery.ts`) issues `GET {base_url}/models` and
+  accepts `{data:[{id}]}` (OpenAI shape), `{models:[{name}]}` (Ollama) and bare
+  arrays. **Find models** costs nothing, needs no model chosen, and is what
+  confirms a base URL and key are accepted.
+- **`probeAgent`** issues a real one-token completion. **Send a test message**
+  confirms the *model id* is valid too, and the UI says plainly that it spends a
+  request on that account.
+- Discovery is its own module with its own `fetch` seam so an **unsaved draft**
+  profile can be verified — otherwise the user would have to save a wrong
+  configuration to find out it is wrong.
+- Failures are returned as data, never thrown, and never contain a key.
+  `DiscoveryResult` carries `status?: number` so the UI can distinguish causes.
+- Timeouts are explicit and separate: `DISCOVERY_TIMEOUT_MS = 15000`,
+  `PROBE_TIMEOUT_MS = 30000`, and at most `MAX_MODELS = 200` are kept.
+
+### Added — Tavily web search as a research source
+
+- **`src/research/sources/tavily.ts`** — a `ResearchSource` over
+  `POST https://api.tavily.com/search`, registered as `TAVILY_SOURCE_ID`.
+- **Citation integrity is enforced, not assumed.** Every finding must carry a
+  `title` and a `url` that survives `safeUrl()`; anything else is dropped. The
+  source **never asks Tavily for a synthesised answer** (`include_answer` is not
+  sent) — a generated summary would be a model suggestion masquerading as
+  evidence.
+- **Confidence is capped at `MAX_TAVILY_CONFIDENCE = 0.6`** and scaled by
+  Tavily's own relevance `score`; a result with no score gets half the ceiling.
+  Results below `MIN_RESULT_SCORE = 0.2` are dropped. (For comparison: Wikipedia
+  `0.45`, Puter web search `0.6`.)
+- **Two transports, feature-detected.** In the desktop app, searches go through
+  the Python host (`createDesktopTavilyTransport`); in a browser, the source
+  calls Tavily directly. `DesktopApi.web_search` is **optional and deliberately
+  absent from `REQUIRED_METHODS`**, so `PROTOCOL_VERSION` stays at 1 and an older
+  host simply falls back to the browser path instead of failing to start.
+- **The bridge is not a proxy.** `web_search` accepts a query and bounded
+  options, never a URL — `TAVILY_URL` is a module constant, never caller input.
+  The worst a compromised page can do is spend search credits, not redirect the
+  host at an arbitrary address. Python also reads the key from `TAVILY_API_KEY`
+  in the environment, so a user can keep it out of the browser entirely.
+- Payloads are clamped in Python (`build_body` allowlist,
+  `MAX_SEARCH_PAYLOAD_BYTES = 64 KiB`) and responses are mapped defensively:
+  schemas validate *shape*, and usability checks live in the mapping, so one bad
+  row cannot fail a whole response.
+- Because the desktop bridge has no abort support, cancellation and timeout for
+  that transport are enforced locally in `raceAbort`.
+
+### Changed
+
+- **`ProviderIdSchema` is unchanged** — still `puter | openai_compatible |
+  scripted`. Custom agents reuse `openai_compatible`; there is no new enum
+  member, no second provider instance and no dual runtime path.
+- **`validateBaseUrl` is exported** from `openai_compatible.ts` and shared by the
+  provider and by discovery, so the URL/loopback rule is written once. Plain
+  `http` remains allowed only for loopback hosts.
+- **`capabilities().model_catalog`** now reflects what discovery actually found
+  rather than a static list.
+- **`saveSettings` accepts either the legacy `string | null` key or a
+  `SettingsSecrets` object** (`{ apiKey?, agentApiKeys?, tavilyApiKey? }`), so
+  existing callers keep working.
+- **`loadSettings` returns `{ settings, apiKey, agentApiKeys, tavilyApiKey,
+  warning }`** and runs `migrateSettings`.
+- **`ElProps.checked?: boolean`** added to `src/ui/dom.ts` — without it, checkbox
+  state could not be rendered declaratively.
+- **`src/ui/components/settings.ts`** `onSave` is now
+  `(settings, secrets: SettingsSecrets)`; the modal is a pure function of its
+  inputs, and async results arrive through the `agentCheck` prop rather than
+  through component state.
+- Tavily is registered **only when enabled and keyed**; enabling it without a key
+  is reported as "the source simply is not registered" rather than failing
+  silently at search time.
+
+### Fixed — found while building the above
+
+- **A 404 on `/models` was reported as a generic HTTP failure**, which reads like
+  a configuration error. Many OpenAI-compatible servers do not implement
+  `/models` at all, so that message sent users debugging a base URL and key that
+  were correct. It now says: *"`{endpoint}` does not implement a model list
+  (HTTP n). That is common, and not a failure of the base URL or key — type the
+  model id by hand instead."* Found by `tests/custom_agents.test.ts`, not by
+  inspection.
+- **Destructuring `persist_tavily_api_key` out of `rest` in `settings_store.ts`
+  silently reset the preference on every load.** Caught during self-review before
+  it shipped; the field is now read off the settings value, and the persisted
+  schema carries it.
+- **`agent_api_keys` could be erased by a partial save.** `saveSettings` now
+  merges with stored keys instead of replacing the map.
+
+### Tests
+
+- **`tests/custom_agents.test.ts` — 49 tests**: `validateBaseUrl`,
+  `discoverModels` (all three response shapes, 401/403/404/405/500, timeout,
+  malformed JSON, empty list), `probeAgent`, URL/payload helpers, provider
+  `listModels`, agent profiles in settings, migration, the secrets store, and the
+  composition root.
+- **`tests/tavily.test.ts` — 44 tests**: request shape, citation integrity,
+  confidence scaling, failures (401/429/432/503/404/network/abort), registration
+  on and off, the desktop transport, and the mapping helpers.
+- **`tests/settings_ui.test.ts` — 38 tests**: the agent editor, add/switch/remove
+  profiles, the profile cap, discovery and probe display (including that one
+  agent's result is never shown against another), saving refusals, key
+  persistence opt-in, and the three research toggles not disturbing each other.
+- **`desktop/ideno_desktop/tests/test_websearch.py` — 22 tests**: `build_body`
+  allowlist and clamping, `resolve_api_key` precedence, `search` endpoint,
+  headers, timeout bounds, status mapping, non-JSON and oversize responses, and
+  `BridgeWebSearch` — including a hostile payload carrying `url`/`endpoint` keys
+  that asserts `urlopen` was **still** called with `TAVILY_URL`.
+- Totals: **580 TypeScript tests across 20 files** and **100 Python tests**, all
+  passing by execution. `tsc --noEmit` clean; `npm run build` succeeds.
+
+### Not verified, stated plainly
+
+- **Whether Tavily permits browser-side (CORS) calls is UNVERIFIED.**
+  `api.tavily.com` is unreachable from this sandbox (`curl` → `connect=000`), and
+  no documentation or search result states its CORS policy. Every documented
+  Tavily example is server-side, and the JS SDK is `require("@tavily/core")`.
+  **The desktop path is the one to rely on.** A browser CORS block surfaces as a
+  `TypeError` / "Failed to fetch" with no status code — indistinguishable from a
+  dead network — unlike 401 or 429, which are reported specifically.
+- **No call was made to the live Tavily service**, from TypeScript or from
+  Python. Both are verified against injected transports and stubbed `urlopen`
+  only, exactly as `WikipediaSource` is.
+- **The agent-profile and Tavily UI paths have not been exercised in a real
+  browser.** No browser engine is obtainable in this environment. The UI is
+  tested through jsdom against the real component, which covers logic and
+  rendering but not layout, focus, or engine-specific behaviour.
+- The v0.2 caveats still stand: no real browser engine, no WebGL frames, no
+  Puter sign-in popup, no browser-native quota behaviour, and no confirmation
+  that a desktop window opens and renders.
+
 ## 0.2.0 — 2026-10-07
 
 Two things are being delivered together, at the user's request: a **hardening

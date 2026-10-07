@@ -31,6 +31,8 @@
 import { isQuotaError, messageOf, type Store, type StoreKind } from '../core/state_manager/store.js';
 
 /** Protocol version this build of the UI speaks. The host reports its own. */
+import type { TavilyTransport } from '../research/sources/tavily.js';
+
 export const DESKTOP_PROTOCOL_VERSION = 1;
 
 export type BridgeResult =
@@ -45,6 +47,17 @@ export interface DesktopApi {
   write(key: string, value: string): Promise<BridgeResult>;
   remove(key: string): Promise<BridgeResult>;
   list(): Promise<BridgeResult>;
+  /**
+   * Performs a web search on the host side and returns the raw JSON body as a string.
+   *
+   * Optional, and deliberately absent from `REQUIRED_METHODS`: a host built before this
+   * method existed must still connect. Its absence is detected at runtime and the caller
+   * falls back to a direct browser request.
+   *
+   * The payload is a JSON string rather than an object because pywebview marshals simple
+   * scalars reliably and complex structures less so.
+   */
+  web_search?(payload: string): Promise<BridgeResult>;
 }
 
 export interface DesktopHost {
@@ -352,4 +365,97 @@ export async function initDesktopStore(options: DesktopStoreOptions = {}): Promi
     return null;
   }
   return store;
+}
+
+/**
+ * Routes Tavily searches through the desktop host instead of the browser.
+ *
+ * Worth having for one concrete reason: a browser enforces CORS on a cross-origin
+ * `fetch`, and whether Tavily permits calls from a web page is not something Ideno
+ * controls or could verify. The Python host has no such restriction, so on the desktop
+ * the same search simply works.
+ *
+ * Returns **null** when the connected host does not offer `web_search`, which is the
+ * case for any host built before the method existed. The caller then falls back to a
+ * direct browser request, which reports a blocked call as a blocked call rather than as
+ * "no results" — the distinction is the whole point of having two transports.
+ *
+ * The key travels with the request because that is where the user put it. A host that
+ * would rather keep the key out of the browser entirely can ignore the supplied value
+ * and read `TAVILY_API_KEY` from its own environment; the Python side does exactly that
+ * when no key is supplied.
+ */
+export function createDesktopTavilyTransport(host: DesktopHost): TavilyTransport | null {
+  const search = host.api.web_search;
+  if (typeof search !== 'function') return null;
+  const call = search.bind(host.api);
+
+  return {
+    kind: 'desktop',
+    async post(request) {
+      const payload = JSON.stringify({
+        provider: 'tavily',
+        body: request.body,
+        // Sent as a plain string and never echoed back in an error message.
+        api_key: request.api_key,
+        timeout_ms: request.timeout_ms,
+      });
+
+      // The bridge has no abort support of its own, so cancellation is enforced here:
+      // a turn that has been abandoned must not keep a search running, and must not
+      // deliver a result to a state that has moved on.
+      const result = await raceAbort(
+        call(payload).then(
+          (value) => ({ value } as const),
+          (error: unknown) => ({ error } as const),
+        ),
+        request.signal,
+        request.timeout_ms,
+      );
+      if (result === 'cancelled') {
+        throw new Error(request.signal?.aborted ? 'The web search was cancelled.' : `The desktop host did not answer within ${request.timeout_ms} ms.`);
+      }
+      if ('error' in result.outcome) {
+        throw new Error(`The desktop host could not run the web search (${messageOf(result.outcome.error)}).`);
+      }
+
+      const bridge = result.outcome.value;
+      if (!bridge.ok) {
+        throw new Error(bridge.error || 'The desktop host refused the web search.');
+      }
+      const body = bridge.value;
+      if (typeof body !== 'string' || body.trim().length === 0) {
+        throw new Error('The desktop host returned no search results.');
+      }
+      try {
+        return JSON.parse(body) as unknown;
+      } catch {
+        throw new Error('The desktop host returned a search result that was not valid JSON.');
+      }
+    },
+  };
+}
+
+/** Resolves with the outcome, or `'cancelled'` if the signal fired or time ran out. */
+async function raceAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): Promise<{ outcome: T } | 'cancelled'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const abort = new Promise<'cancelled'>((resolve) => {
+    if (signal?.aborted) {
+      resolve('cancelled');
+      return;
+    }
+    const cancel = (): void => resolve('cancelled');
+    signal?.addEventListener('abort', cancel, { once: true });
+    timer = setTimeout(cancel, Math.max(1000, timeoutMs));
+  });
+  try {
+    const outcome = await Promise.race([promise, abort]);
+    return outcome === 'cancelled' ? 'cancelled' : { outcome };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }

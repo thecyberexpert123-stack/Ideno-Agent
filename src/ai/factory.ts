@@ -7,8 +7,10 @@
  * case here, add one entry to `ProviderIdSchema`.
  */
 import type { Settings } from './settings.js';
+import { activeAgent } from './settings.js';
 import type { ResearchRegistry, ResearchSource } from '../research/evidence.js';
 import { createWikipediaSource, WIKIPEDIA_SOURCE_ID } from '../research/sources/wikipedia.js';
+import { createTavilySource, TAVILY_SOURCE_ID, type TavilyTransport } from '../research/sources/tavily.js';
 import { createPuterWebSearchSource, PUTER_WEB_SEARCH_SOURCE_ID } from './research/puter_web_search.js';
 import { OpenAICompatibleProvider, type FetchLike } from './providers/openai_compatible.js';
 import { PuterProvider, type PuterLoader } from './providers/puter.js';
@@ -23,6 +25,32 @@ export interface ProviderRegistryOptions {
   puterLoader?: PuterLoader;
   /** Test seam for HTTP. */
   fetchImpl?: FetchLike;
+  /**
+   * The live custom-agent profile, and its key if one is held.
+   *
+   * Passed in rather than read from settings because a key may exist only in memory, and
+   * memory is not something the settings object carries.
+   */
+  agentApiKey?: string | null;
+}
+
+/**
+ * The endpoint configuration a call should use.
+ *
+ * Prefers the active custom-agent profile and falls back to the legacy single endpoint,
+ * so a configuration saved before profiles existed keeps working without a migration
+ * having run first.
+ */
+export function endpointFor(settings: Settings): { base_url: string; model: string; json_mode: boolean } {
+  const agent = activeAgent(settings);
+  if (agent && (agent.base_url || agent.model)) {
+    return { base_url: agent.base_url, model: agent.model, json_mode: agent.json_mode };
+  }
+  return {
+    base_url: settings.openai.base_url,
+    model: settings.openai.model,
+    json_mode: settings.openai.json_mode,
+  };
 }
 
 export interface ProviderBundle {
@@ -42,10 +70,15 @@ export function createAIRuntime(settings: Settings, options: ProviderRegistryOpt
     loader: options.puterLoader,
   });
 
+  const endpoint = endpointFor(settings);
   const openai = new OpenAICompatibleProvider({
-    base_url: settings.openai.base_url,
-    model: settings.openai.model,
-    json_mode: settings.openai.json_mode,
+    base_url: endpoint.base_url,
+    model: endpoint.model,
+    json_mode: endpoint.json_mode,
+    // Optional by design: a local model server needs no key, and sending an empty
+    // Authorization header would make some of them refuse a request they would
+    // otherwise serve.
+    ...(options.agentApiKey ? { api_key: options.agentApiKey } : {}),
     fetch_impl: options.fetchImpl,
   });
 
@@ -69,12 +102,13 @@ export function createAIRuntime(settings: Settings, options: ProviderRegistryOpt
 
 /** Applies settings changes to an existing bundle without rebuilding providers. */
 export function applySettings(bundle: ProviderBundle, settings: Settings, apiKey?: string | null): void {
+  const endpoint = endpointFor(settings);
   const openai = bundle.providers.openai_compatible;
   if (openai instanceof OpenAICompatibleProvider) {
     openai.update({
-      base_url: settings.openai.base_url,
-      model: settings.openai.model,
-      json_mode: settings.openai.json_mode,
+      base_url: endpoint.base_url,
+      model: endpoint.model,
+      json_mode: endpoint.json_mode,
       ...(apiKey !== undefined ? { api_key: apiKey ?? undefined } : {}),
     });
   }
@@ -95,6 +129,19 @@ export function applySettings(bundle: ProviderBundle, settings: Settings, apiKey
 export interface ResearchSourceOptions {
   /** Test seam for HTTP, shared with the OpenAI-compatible provider. */
   fetchImpl?: FetchLike;
+  /**
+   * Tavily key, held in memory unless the user opted into persisting it.
+   * Without one the Tavily source is not registered at all.
+   */
+  tavilyApiKey?: string | null;
+  /**
+   * Route Tavily calls through the desktop host instead of the browser.
+   *
+   * Injected by the composition root, which is the only layer allowed to know a desktop
+   * host exists. Left unset, Tavily is called directly and a browser that blocks the
+   * cross-origin request reports that specifically.
+   */
+  tavilyTransport?: TavilyTransport;
 }
 
 /**
@@ -114,6 +161,18 @@ export function createResearchSources(settings: Settings, options: ResearchSourc
     sources.push(
       createPuterWebSearchSource({ model: settings.puter_model, timeout_ms: settings.timeout_ms }),
     );
+  }
+  if (settings.research.tavily) {
+    // `createTavilySource` returns null when there is no key, so switching the source on
+    // without one degrades to "not registered" rather than to a source that fails on
+    // every question.
+    const tavily = createTavilySource({
+      api_key: options.tavilyApiKey ?? undefined,
+      transport: options.tavilyTransport,
+      timeout_ms: settings.timeout_ms,
+      ...(options.fetchImpl ? { fetch_impl: options.fetchImpl as typeof fetch } : {}),
+    });
+    if (tavily) sources.push(tavily);
   }
   return sources;
 }
@@ -138,7 +197,7 @@ export function syncResearchSources(
   const wanted = createResearchSources(settings, options);
   const wantedIds = new Set(wanted.map((source) => source.id));
 
-  for (const id of [WIKIPEDIA_SOURCE_ID, PUTER_WEB_SEARCH_SOURCE_ID]) {
+  for (const id of [WIKIPEDIA_SOURCE_ID, PUTER_WEB_SEARCH_SOURCE_ID, TAVILY_SOURCE_ID]) {
     if (!wantedIds.has(id)) registry.unregister(id);
   }
   for (const source of wanted) {
@@ -152,6 +211,6 @@ export function syncResearchSources(
 
 function modelFor(settings: Settings): string | null {
   return settings.provider_id === 'openai_compatible'
-    ? settings.openai.model || null
+    ? endpointFor(settings).model || null
     : settings.puter_model;
 }

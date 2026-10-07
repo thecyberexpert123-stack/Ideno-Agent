@@ -298,3 +298,87 @@ So that no later reader mistakes an assumption for a fact:
 | A pywebview window opening on Linux | **Never observed.** No display server, no web engine installed |
 | Persistence behaviour in a real browser at the 5 MB boundary | **Measured in-process** against a store that reproduces `QuotaExceededError`/`NS_ERROR_DOM_QUOTA_REACHED`, not in a browser |
 | Streaming against a live Puter endpoint | **Never made.** Tested against a scripted async iterable matching the shipped `ChatResponseChunk` type |
+| Live Tavily responses, from TypeScript or Python | **Never made.** `api.tavily.com` is unreachable from the sandbox (`curl` → `connect=000`). Both paths tested against an injected transport and a stubbed `urlopen` |
+| **Whether Tavily permits browser-side (CORS) calls** | **UNVERIFIED, and it matters.** See §11. No documentation or search result states the policy, and every documented example is server-side |
+| `GET /models` against a live OpenAI-compatible server | **Never made.** All three response shapes tested against an injected `DiscoveryFetch` |
+| The agent-profile and Tavily Settings UI in a real browser | **Never exercised in a browser engine.** Tested through jsdom against the real component (38 tests), which covers logic and rendering but not layout, focus, or engine-specific behaviour |
+
+## 11. Tavily Search API — and the CORS question that could not be settled
+
+### Sources
+
+| Source | What it was used for |
+| --- | --- |
+| `https://docs.tavily.com/documentation/api-reference/endpoint/search` | Endpoint, headers, request body, response shape, status codes |
+| `https://docs.tavily.com/documentation/api-reference/introduction` | Auth model, credit costs, keyless mode |
+| Tavily SDK reference (same docs) | That the JS SDK is `require("@tavily/core")` — a Node package, not a browser one |
+| `curl https://api.tavily.com/` from the build environment | **`connect=000` — host unreachable.** An `OPTIONS` preflight probe returned no CORS headers at all |
+
+### Verified facts
+
+- **`POST https://api.tavily.com/search`.** Headers: `Authorization: Bearer tvly-YOUR_API_KEY`
+  (**required**) and `Content-Type: application/json`. Optional: `X-Project-ID`,
+  `X-Session-Id`, `X-Human-Id`.
+- **Only `query` is required** in the body (keep it under 400 characters). Notable optional
+  parameters: `search_depth` (`ultra-fast | fast | basic | advanced`, default `basic`;
+  **advanced costs 2 credits vs 1**), `max_results` (0–20), `chunks_per_source`, `topic`
+  (`general | news | finance`), `time_range`, `start_date`/`end_date` (YYYY-MM-DD),
+  `include_answer` (`false | "basic" | "advanced"`), `include_raw_content`,
+  `include_domains` (≤300) / `exclude_domains` (≤150), `country`, `language`,
+  `include_images`, `include_published_date`, `safe_search`, `include_usage`.
+- **Response 200:** `{ query, answer?, results: [{ title, url, content, score, raw_content?,
+  published_date?, id }], images?, response_time, request_id?, usage? }`.
+- **`score` is a 0–1 relevance float**, and **every result carries `title` and `url`** — which
+  is what makes Tavily usable behind Ideno's citation-integrity gate at all.
+- **Documented status codes:** 200, 400, 401, 422, 429, 432, 433, 500. (432/433 are
+  Tavily-specific and are mapped to explicit user-facing messages rather than a generic
+  failure.)
+- Other endpoints exist — `/extract`, `/crawl`, `/research` (plus `GET /research/{request_id}`,
+  SSE streaming), `GET /usage` — none used here.
+- A **keyless** mode exists (`X-Tavily-Access-Mode: keyless`, rate-limited; a valid
+  `Authorization` header takes precedence). Not used: Ideno would rather report "no key is set"
+  than silently consume a shared, rate-limited allowance the user did not ask for.
+- Free tier ≈ **1 000 credits/month**.
+
+### What this decided
+
+- **`include_answer` is never sent.** Tavily's `answer` is a synthesised summary. Presenting it
+  as evidence would put a model suggestion in the evidence panel with a citation attached,
+  which is exactly the failure the product exists to prevent. Only `results[]` become findings.
+- **Confidence is capped at `0.6` and scaled by `score`.** A search engine's top hit and its
+  tenth are not equally trustworthy; a flat confidence would let a weak result outrank a strong
+  one. A result with no `score` gets half the ceiling; results below `0.2` are dropped.
+- **Schemas validate shape, usability lives in the mapping** — the lesson from §6 and the Puter
+  `annotations` work, applied again. One malformed row cannot fail a whole response; it is
+  dropped individually.
+- **Two transports, feature-detected**, because the docs are uniformly server-side (see below)
+  and the desktop host is the path that is actually known to be sound.
+- **The Python host is not a proxy.** `websearch.py` uses stdlib `urllib` only — no new
+  dependency — and `TAVILY_URL` is a module constant, never caller input.
+
+### Not verified, and why it matters
+
+**Whether Tavily allows browser-side calls is UNVERIFIED.** This is the single largest open
+risk in v0.3, and it is stated here so no later reader assumes it was settled:
+
+- `api.tavily.com` is **unreachable from the build environment** (`curl` → `connect=000`), so
+  no live preflight could be observed. An `OPTIONS` probe returned **no CORS headers at all**,
+  which is consistent both with "blocked" and with "the probe never got through".
+- **No documentation page and no search result states a CORS policy** for the Search API.
+- **Every documented example is server-side** — curl, Python, JS via `require`, PHP, Go, Ruby,
+  Java. There is no browser example, and the official JS SDK is `require("@tavily/core")`, a
+  CommonJS Node package.
+
+The practical consequence for anyone debugging this: **a browser CORS block surfaces as a
+`TypeError` / "Failed to fetch" with no status code**, which is indistinguishable from a dead
+network or a wrong URL. A 401 or 429, by contrast, is reported specifically because those
+arrive with a status. So if Tavily returns nothing in a browser while working from the desktop
+app, suspect CORS before suspecting the key.
+
+**The desktop path is the one to rely on.** It is also the stronger position for the secret:
+Python reads the key from the payload *or* from `TAVILY_API_KEY` in the environment, so a user
+can keep it out of the browser entirely.
+
+This mirrors §6 (Wikipedia), where the same constraint produced the same discipline: only
+injected-`fetch` tests are possible, so the tests verify the request shape, the mapping and the
+failure handling, and the document records that the live service was never contacted.

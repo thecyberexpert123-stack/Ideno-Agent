@@ -53,15 +53,18 @@ src/
 │   │   ├── runtime.ts             AIRuntime: contract, timeout, extract, validate, repair
 │   │   └── json_extract.ts        JSON from prose, fences, stray braces, trailing commas
 │   ├── providers/{puter,openai_compatible,scripted}.ts
-│   ├── settings.ts                provider ids and provider configuration
-│   ├── settings_store.ts          settings persistence + API-key handling
+│   ├── settings.ts                provider ids, agent profiles, provider configuration
+│   ├── settings_store.ts          settings persistence + per-agent and Tavily secrets
+│   ├── discovery.ts               GET /models and the live test completion
 │   ├── errors.ts                  AIError + typed codes + user-facing hints
 │   └── factory.ts                 the only file that knows concrete providers exist
 ├── reasoning/
 │   ├── prompts.ts                 the product's point of view, per operation
 │   ├── context.ts                 state digest, transcript window, pending digest
 │   └── operations.ts              prepareOperation: state + conversation → messages
-├── research/evidence.ts           ResearchSource, registry, gap analysis, evidence drafts
+├── research/
+│   ├── evidence.ts                ResearchSource, registry, gap analysis, evidence drafts
+│   └── sources/{wikipedia,puter_web_search,tavily}.ts   the concrete sources
 ├── render/canonical.ts            quantity parsing, CanonicalScene, projection
 ├── plugins/registry.ts            plugin + renderer + research-source extension points
 ├── ui/                            dom.ts (safe builder), components/, app.ts, styles.css
@@ -474,3 +477,131 @@ plan.
 | Version snapshots grow quadratically | Low | Low (at v0.1 scale) | 1000-version cap that refuses loudly; `parent_id` already supports delta encoding later | Deliberate trade-off, documented |
 | Prompt drift as operations are added | Medium | Medium | One contract for all operations; JSON Schema generated from the validator; a test asserts it stays representable | — |
 | Supply-chain risk from a browser SDK with a large dependency tree | Low | High | Pinned version + lockfile, dynamic import, `open` verified as Node-only, no secrets in the app | The SDK executes in the page; that trust is inherent to Puter's model and is documented |
+
+## 10. What changed in v0.3, and the decisions behind it
+
+Three capabilities — custom agents, endpoint discovery, Tavily search — landed
+without a new provider, a new protocol version, or a second runtime path. Each
+decision below was chosen over a simpler-looking alternative that would have cost
+something later.
+
+### 4.11 Custom agents are data, not code
+
+The obvious reading of "support custom agents" is a new `ProviderIdSchema` member
+per agent, or one provider instance per profile. Both were rejected.
+
+An agent profile is `{ id, name, base_url, model, json_mode, persist_api_key }` —
+configuration, not behaviour. Every custom endpoint Ideno needs to reach speaks
+OpenAI-compatible chat completions, so `openai_compatible` **is** the custom-agent
+provider. The consequences are worth stating because they are the reason this is
+the right shape:
+
+- no new enum member, so no `switch` anywhere gains a case;
+- no second provider instance, so no divergence between "the OpenAI provider" and
+  "the custom agent provider";
+- `factory.ts` stays the only file that knows concrete providers exist;
+- adding a profile cannot break the build, because adding a profile is not a code
+  change.
+
+The legacy `settings.openai` object is read once by `migrateSettings` on every
+load (idempotently) and then cleared. Its key is carried into
+`agent_api_keys[id]` **only if** that profile had `persist_api_key` set. Migration
+must never silently widen a security decision the user already made — a key the
+user chose not to persist does not become persisted because the schema moved.
+
+### 4.12 Discovery has its own module and its own fetch seam
+
+`GET {base_url}/models` cannot reuse the provider's `FetchLike`, because that seam
+declares `body: string` as **required** — and real `fetch` *throws*
+(`Request with GET/HEAD method cannot have body`) if a body is passed on a GET.
+
+Two seams now coexist deliberately:
+
+| Seam | Body | Used by |
+| --- | --- | --- |
+| `DiscoveryFetch` (`discovery.ts`) | `body?: string` optional | `GET /models`, and the probe's POST |
+| `FetchLike` (`openai_compatible.ts`) | `body: string` required | chat completions only |
+
+Widening `FetchLike` to make `body` optional would have been backwards compatible
+for existing callers, but it would have weakened a guarantee the provider relies
+on: every completion it sends *has* a body. Tests adapt at the boundary with one
+documented `asProviderFetch` helper rather than weakening either seam.
+
+Discovery is a standalone module for a reason that is easy to miss: **an unsaved
+draft profile must be verifiable.** If discovery lived inside the provider, the
+only way to check a base URL would be to save it first — which means committing a
+configuration you suspect is wrong in order to find out whether it is. The UI
+therefore keeps a `settingsDraft`, hands it to discovery, and re-renders from the
+result.
+
+Discovery failures are returned as data, never thrown, and never contain a key.
+`DiscoveryResult` carries `status?: number` so the UI can distinguish "rejected
+your credentials" (401/403) from "does not implement `/models`" (404/405) from
+"unreachable" — three situations that need three different pieces of advice.
+
+### 4.13 Tavily's transport is injected, so the source module stays host-agnostic
+
+An architecture rule confines desktop-host knowledge to `desktop_bridge.ts` and
+`app.ts`. A research source that imported the bridge would break it, and a source
+that hardcoded `fetch` could not use the host at all.
+
+So `createTavilySource` takes a `TavilyTransport`, and the composition root
+(`app.ts`) decides which one to inject: `createDesktopTavilyTransport(host)` when
+a desktop host exposes `web_search`, else the browser transport. The source module
+never learns whether it is running in a window or a browser tab. This is the same
+seam `WikipediaSource` uses, applied one level up.
+
+### 4.14 The desktop search route is optional and feature-detected
+
+`DesktopApi.web_search` is **deliberately absent from `REQUIRED_METHODS`**, so
+`PROTOCOL_VERSION` stays at 1. `createDesktopTavilyTransport` returns `null` when
+the method is missing, and the caller falls back to browser-direct.
+
+The alternative — bumping the protocol version and requiring the method — would
+have made every existing desktop host refuse to start after an app update, for a
+feature that is off by default. An optional method with a runtime fallback costs
+one null check and preserves compatibility, which is the cheaper trade.
+
+Because the bridge has no abort support, cancellation and timeout for that
+transport are enforced locally in `raceAbort`: the promise settles on the earlier
+of the bridge result and a timer, and a late result is discarded rather than
+applied.
+
+### 4.15 The bridge is not a proxy
+
+`web_search` accepts a query and bounded options — **never a URL**. `TAVILY_URL`
+is a module constant in `websearch.py`, not caller input.
+
+This is a deliberate narrowing. A generic "fetch this URL for me" bridge method
+would turn the Python host into an open proxy running with the user's network
+position and environment; a compromised or buggy page could then reach internal
+services that the browser itself could not. As written, the worst a hostile page
+can do is spend Tavily search credits. `test_websearch.py` asserts this directly:
+a payload carrying `url` and `endpoint` keys is still sent to `TAVILY_URL`.
+
+Python reads the key from the payload **or** from `TAVILY_API_KEY` in the
+environment, so a user can keep the secret out of the browser entirely — the
+strongest available position, and one the browser transport cannot offer.
+
+### 4.16 Confidence ceilings are per source, and Tavily scales by relevance
+
+Each source caps confidence at what its own guarantees support: Wikipedia `0.45`
+(a summary of an article is not the article), Puter web search `0.6`, Tavily `0.6`
+**scaled by Tavily's own relevance `score`**, with a result carrying no score
+getting half the ceiling and results below `MIN_RESULT_SCORE = 0.2` dropped.
+
+Scaling rather than assigning a flat value matters: a search engine's top hit and
+its tenth are not equally trustworthy, and pretending otherwise would let a weak
+result outrank a strong one in the evidence panel.
+
+The source **never sends `include_answer`**. Tavily can return a synthesised
+answer, and a synthesised answer is a model suggestion — presenting it as evidence
+would violate the product's central rule. Only `results[]`, each with a `title`
+and a `url` that survives `safeUrl()`, become findings.
+
+### Still open after v0.3
+
+| Question | Position | Why it is not decided |
+| --- | --- | --- |
+| Plain `http` for a non-loopback host | **Still blocked.** `http://192.168.1.5:11434/v1` is rejected even with no key configured | Relaxing it is a deliberate security change, not a bug fix. A keyless LAN endpoint would work if allowed, but so would plaintext interception of idea content on that network. Needs the user's decision, with the warning surfaced in the UI |
+| Tavily from a browser | **Unverified.** `api.tavily.com` is unreachable from the build environment and no source states its CORS policy | Cannot be settled by reading or by testing here. Every documented Tavily example is server-side. The desktop path is the one to rely on |

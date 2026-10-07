@@ -145,12 +145,20 @@ being read, responses carry `X-Content-Type-Options: nosniff` and
 `Referrer-Policy: no-referrer`, and hashed build assets are immutable-cached while
 the entry point is `no-store`.
 
-**The bridge takes keys, not paths.** `window.pywebview.api` exposes six methods —
-`info`, `snapshot`, `read`, `write`, `remove`, `list` — and every storage method
-accepts a *key* which must match `^[A-Za-z0-9._-]+$`, must not be `.` or `..`, and
-is re-validated after path resolution to confirm it still lands inside the workspace
+**The bridge takes keys, not paths.** `window.pywebview.api` exposes eight methods.
+Six are **required** and the UI refuses a host missing any of them — `info`,
+`snapshot`, `read`, `write`, `remove`, `list` — and every storage method accepts a
+*key* which must match `^[A-Za-z0-9._-]+$`, must not be `.` or `..`, and is
+re-validated after path resolution to confirm it still lands inside the workspace
 directory. A bridge that accepted paths would be a filesystem proxy for whatever
 ends up running in the page.
+
+Two are **optional**, so `protocol` stays at `1` and an older host still connects:
+`data_dir` (where the workspace lives, for display) and `web_search` (Tavily, see
+below). Optionality is checked at runtime, and the caller falls back — a web search
+goes browser-direct, a data directory simply is not shown. Requiring them instead
+would make every existing host refuse to start after an app update, for features that
+are off by default.
 
 **The bridge has no policy.** It reads and writes documents and reports what
 happened. Deciding what to save, when to prune, and what a quota failure means stays
@@ -170,10 +178,25 @@ into a generic I/O error would reduce "your disk is full" to "your idea is gone"
 that reports anything else, naming both versions. A host and a bundle from different
 releases of Ideno fail with a sentence instead of corrupting a workspace.
 
-**No API keys travel through Python.** Model calls go from the web engine to the
-provider directly (Puter bills the signed-in user; an OpenAI-compatible key stays in
-the page). The host stores what the app writes and never sees a credential it did not
-need.
+**Model keys never travel through Python.** Model calls go from the web engine to the
+provider directly (Puter bills the signed-in user; an OpenAI-compatible or custom-agent
+key stays in the page). The host stores what the app writes and never sees a model
+credential it did not need.
+
+**One deliberate exception: the Tavily key, and only for search.** `web_search` may
+carry a Tavily key so the host can make the call itself — or it can read
+`TAVILY_API_KEY` from its own environment, which keeps the secret out of the browser
+entirely and is the stronger position. The payload takes precedence over the
+environment, so a user can override per call.
+
+This is safe because **`web_search` is not a proxy.** It accepts a query and bounded
+options, and never a URL: `TAVILY_URL` is a module constant, not caller input, the
+request body is built from an allowlist with clamped values, and responses over
+`MAX_SEARCH_PAYLOAD_BYTES` (64 KiB) are rejected. A compromised or buggy page can spend
+search credits; it cannot point the host at an arbitrary address, and so cannot use the
+user's network position to reach internal services the browser itself could not.
+`test_websearch.py` asserts this directly — a payload carrying `url` and `endpoint` keys
+is still sent to `TAVILY_URL`.
 
 ---
 
@@ -184,7 +207,7 @@ cd desktop
 python3 -m unittest discover -s ideno_desktop/tests -t .
 ```
 
-78 tests, and they run **with or without pywebview installed** — the GUI toolkit is
+100 tests, and they run **with or without pywebview installed** — the GUI toolkit is
 imported inside the function that opens a window, never at module scope, because
 importing Qt on a machine with no display can abort the process. Detection uses
 `importlib.util.find_spec` rather than a real import for the same reason.
@@ -197,6 +220,13 @@ validation, bundle location and build orchestration, bridge error containment, a
 the startup messages. `test_serve.py` starts a real server on a real loopback socket
 and makes real HTTP requests, asserting MIME types, cache headers, traversal
 refusals and method refusal.
+
+`test_websearch.py` adds 22 of those tests: the request-body allowlist and value
+clamping, key resolution precedence (payload over environment), the endpoint and
+headers actually used, timeout bounds, HTTP status mapping, non-JSON and oversize
+responses, and the bridge entry point — including the hostile-payload case described
+above. No test contacts `api.tavily.com`; `urlopen` is stubbed, because that host is
+unreachable from the build environment.
 
 The TypeScript half of the same contract is tested in `tests/desktop_bridge.test.ts`
 against a fake host speaking the same protocol, which is how both sides are verified
@@ -212,9 +242,18 @@ Recorded because the difference matters.
 `--check`; the refusal message and exit code when no engine is usable; the loopback
 server serving the real built bundle with correct types, cache headers, traversal
 refusals and method refusals; `--browser` mode end to end including data-directory
-and log creation; all 78 Python tests; the TypeScript bridge tests; that the package
+and log creation; all 100 Python tests; the TypeScript bridge tests; that the package
 installs from `pyproject.toml` and provides an `ideno` entry point that works from
 an unrelated working directory.
+
+**Not verified: any call to the live Tavily service.** `api.tavily.com` is unreachable
+from the build environment (`curl` → `connect=000`), so `web_search` is tested with
+`urlopen` stubbed. The request shape, headers, allowlist, clamping, status mapping and
+size limit are all verified against the published API contract; a real response could
+still differ, and the mapping is written so that a difference produces fewer findings
+rather than false ones. Separately, **whether Tavily permits browser-side (CORS) calls
+is unknown** — no documentation states it and every published example is server-side —
+which is the main reason this host route exists. See `docs/RESEARCH.md` §11.
 
 **Not verified:** that a window actually opens and renders. This machine has neither
 a display server (`$DISPLAY` and `$WAYLAND_DISPLAY` are both unset) nor a web engine
