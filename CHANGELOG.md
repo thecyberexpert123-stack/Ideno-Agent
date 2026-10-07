@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses
 semantic versioning.
 
-## 0.2.0 — unreleased, in progress
+## 0.2.0 — 2026-10-07
 
 Two things are being delivered together, at the user's request: a **hardening
 pass** over v0.1 (fix real defects only) and a **hybrid feature increment**
@@ -14,7 +14,7 @@ renderer, a multi-idea workspace) plus a new requirement added mid-flight:
 web engine as the renderer, not only as a website.**
 
 The plan, the ordering and the reasoning are in `docs/V0_2_PLAN.md`. This entry
-records what has actually landed so far.
+records what landed, what was measured, and what was **not** verified.
 
 ### Added — hardening (Part A, complete)
 
@@ -484,13 +484,44 @@ than built, because each is a separable piece of work and none is required by th
 - A `.desktop` entry, an AppImage or Flatpak manifest, and a single-instance lock, so
   the desktop app can be launched from a menu rather than a terminal.
 
+### Verification of the shipped artifact
+
+Everything above is verified against `src/` through vitest. That leaves a gap: the
+production bundle is a different artifact — Rollup chunking, dynamic-import
+resolution and Three.js's CJS/ESM interop (which emits a build warning) only exist
+in `dist/`.
+
+The built bundle was therefore booted directly: `dist/index.html` loaded in jsdom,
+the entry chunk imported from disk, and the five-step acceptance scenario driven
+through the real DOM of the *built* app. It passed — start screen rendered, demo
+entry point found among 9 buttons, all five steps completed, the balcony and
+no-cloud constraints present, both alternatives present, the step-5 decision
+carrying `Your decision` provenance, 5 user and 5 Ideno messages, and the History
+and Spec tabs both rendering. No `window` errors were raised.
+
+This is a throwaway harness, not a committed test: it depends on jsdom shims
+(`ResizeObserver`) and on Node-global patching that would be fragile in the suite.
+It is recorded here because the result matters, not because the script does.
+
+**Still not verified, unchanged:** a real browser engine was never used (no Chromium
+in this environment, and its shared libraries cannot be installed — Debian mirrors
+are unreachable, egress is allowlisted to npm). So WebGL rendering, the Puter sign-in
+popup, and browser-native `localStorage` quota behaviour remain unproven.
+
 ### Repository note
 
-The sandbox this is being developed in was re-cloned from `origin` partway through
-the release, which discarded the eight local v0.1 commits (nothing had been
-pushed, so nothing diverged). The v0.1 files were intact in the working tree and
-are included in the first commit of this sequence; the granular v0.1 history could
-not be recovered.
+The sandbox this is being developed in re-cloned from `origin` **three times** during
+the release. Each time the local commits were discarded; each time the files survived
+in the working tree. The first two resets lost the eight granular v0.1 commits and
+then the five v0.2 feature commits, so this release is recorded in two commits
+(`a5bb8cd`, `d32592b`) on top of the initial one. The granular history could not be
+recovered.
+
+After the third reset the branch was restored from `origin` with
+`git update-ref` + `git reset --mixed`, which moves the ref and the index without
+touching the working tree — no files at risk. **The lesson, recorded so it is not
+relearned: push after every coherent commit.** Unpushed local history in this
+environment should be treated as provisional.
 
 ## 0.1.0 — 2026-10-05
 

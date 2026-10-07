@@ -438,6 +438,14 @@ Stated plainly, because the rest of this file is only useful if this part is hon
   were all really executed. `create_window`/`start` were not.
 - **The 5 MB quota cliff was reproduced in-process**, against a store that raises the
   same error shapes, not in a browser.
+- **The production bundle was booted, but not in a browser.** `dist/index.html` plus the
+  built entry chunk were loaded in jsdom with a `ResizeObserver` shim, and the five-step
+  acceptance scenario was driven through the real DOM of the *built* app — start screen,
+  demo run, all five steps, both tabs, no window errors. That closes the gap between
+  "src passes" and "the shipped artifact works". It does **not** close the browser gap:
+  Chromium is absent and its shared libraries cannot be installed here (Debian mirrors
+  unreachable; egress is allowlisted to npm), so WebGL, the Puter popup and native quota
+  behaviour are still unproven.
 
 Deliberately not built, and recorded as recommendations in `CHANGELOG.md` rather than
 quietly skipped: delta-encoded version snapshots, streaming for the OpenAI-compatible
@@ -446,11 +454,23 @@ provider (needs its `FetchLike` seam widened to a readable body), and
 
 ## 20. A note on this environment, for the next agent
 
-The sandbox reset between turns and wiped `node_modules/`, `/tmp/ideno-venv`, and —
-twice — the entire `.git` history by re-cloning from origin. Local commits that were
+The sandbox reset between turns and wiped `node_modules/`, `dist/`, `/tmp/ideno-venv`,
+and — **three times** — the git refs, by re-cloning from origin. Local commits that were
 never pushed simply ceased to exist, and the granular v0.1/v0.2 history is now
 unrecoverable; everything lives in two commits. Files in the working tree survived
 each time, so no *work* was lost, only its shape.
+
+The third reset happened *after* the branch had been pushed, which is what made it
+recoverable. The fix, worth remembering because it risks nothing:
+
+```sh
+git fetch origin
+git update-ref refs/heads/<branch> origin/<branch>   # move the ref
+git reset --mixed                                    # refresh the index only
+```
+
+`reset --mixed` (the default) leaves the working tree completely alone, so a tree full
+of untracked-but-wanted files is safe. `--hard` here would have deleted the release.
 
 Two practical consequences worth passing on:
 
