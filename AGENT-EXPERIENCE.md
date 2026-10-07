@@ -1,6 +1,7 @@
 # Agent experience log
 
-What actually happened while building Ideno v0.1: the decisions that were hard,
+What actually happened while building Ideno (v0.1, then the v0.2 hardening and
+feature pass): the decisions that were hard,
 the mistakes that were made, how they were caught, and what changed as a result.
 This is written to be useful to the next person (human or agent) who picks the
 project up, so it records wrong turns as well as right ones.
@@ -294,3 +295,169 @@ reported, but it could not be observed here.
 Anyone picking this up should do that smoke test first: point Ideno at a provider with
 network access, send "I want to build a small autonomous greenhouse.", and read what
 comes back.
+
+
+---
+
+# v0.2 — the hardening and feature pass
+
+Sections 1–11 above describe v0.1. What follows is what happened when the shipped
+code was reviewed against itself and then extended.
+
+## 12. The defect that mattered most was one I introduced
+
+The first hardening fix was to validate the session on the save path. It looked
+strictly better — a corrupt in-memory session would now be caught before it reached
+storage. Then I measured it: **71 ms per operation against a 26 ms baseline.** I had
+made every save do two full Zod validations of the entire session, once to build the
+record and once to check it.
+
+The fix was to notice that the in-memory session is valid *by construction*: every
+mutation goes through Core, and Core validates. So `toWorkspace()` does no
+validation, `exportJson()` validates fully (that is a boundary crossing), and the save
+path uses an O(1) `withinLimits` check. Result: **13.7 ms per operation** at 400
+edits, better than the v0.1 baseline at 50.
+
+The lesson is not "don't validate". It is that **a validation added without a
+measurement is a guess wearing a safety costume**, and the guess was expensive.
+Every performance claim in `CHANGELOG.md` for v0.2 is a number I ran, not a number I
+reasoned to.
+
+## 13. Measuring before fixing found the wrong ceiling
+
+The original complaint was "saving gets slow". Measuring it found something worse:
+at about 170 edits the workspace blob crossed a browser's ~5 MB origin budget, and
+from that point **nothing saved at all** — silently. The slow save was the visible
+symptom of a cliff.
+
+That reframed the fix. Pruning snapshots and splitting storage into an index plus one
+record per idea is not a performance optimisation; it is the difference between "slow"
+and "your idea is gone". `isQuotaError` had to match four different failure shapes
+(`QuotaExceededError`, `NS_ERROR_DOM_QUOTA_REACHED`, code 1014, quota-ish text)
+because browsers do not agree on how to say "full".
+
+Worth recording: the residual cost is still superlinear, because each version stores a
+full snapshot. That is written down as a recommendation rather than hidden behind the
+improved numbers.
+
+## 14. `window.prompt` does not exist where this product runs
+
+Labelling and forking a branch needed a name. `window.prompt` is the obvious call and
+it is unusable here: jsdom returns `undefined` from it, and an embedded web engine may
+never show a dialog at all. So the feature would have "worked" in a browser and
+silently done nothing on the desktop — the platform where persistence actually matters.
+
+It was replaced with an inline editor field (Enter to commit, Escape to cancel,
+`stopPropagation` so keystrokes do not reach the conversation input). The general
+lesson: **any UI that depends on a browser chrome dialog is a hidden platform
+dependency.** Same class as `alert`/`confirm`, which Ideno also avoids.
+
+## 15. Three real bugs, all the same shape: a stale reference
+
+Each of these survived a first draft and was caught only because a test asserted on
+what the *user would see* rather than on what the function returned.
+
+1. `el()` in `src/ui/dom.ts` did not set `value` for `<option>`. Every generated select
+   option therefore had `value === ''` — and selects still "worked" in tests that only
+   checked that an option existed.
+2. `archiveBranch` captured a `Branch`, then `#switchTo` rebuilt the body through the
+   schema and replaced the `branches` array. The flag was set on a detached copy, so
+   archiving did nothing. This is the same bug class as the v0.1 `createBranch`
+   stale-reference defect; the fix is structural — `#switchTo` and `restoreVersion` now
+   use `assignIdeaFields` to preserve object identity.
+3. `listIdeas()` read the stored index, which lags memory under coalesced writes. The
+   switcher showed a stale title and count for the *currently open* idea — the one most
+   likely to be wrong. Fixed with `#mergedIndex()`, deriving the open entry from live state.
+
+And a fourth, in the UI rather than the state: a compare `<select>` mutated a view
+object without requesting a re-render, so the comparison never appeared. **Panels are
+pure functions of their inputs; every control must go through an action.** Writing one
+`onclick` that pokes at a view model is the fastest way to get a UI that is correct in
+memory and stale on screen.
+
+## 16. Strict schemas in the wrong place break usable data
+
+`WikipediaSource` originally validated each search hit with `z.string().min(1)` on
+every field. One hit with a missing `description` failed the entire response, so a
+page of nine good results returned zero findings.
+
+The fix was to separate the two jobs: the schema validates *shape* (is this an object
+with the fields we need?), and the mapping step decides *usability* per row
+(`#toFinding` drops a single bad citation and keeps the rest). A validation layer that
+cannot express "partially good" will turn one malformed row into total failure.
+
+The same instinct applies to `PuterWebSearchSource`: citations are dropped
+individually, never collectively.
+
+## 17. Two architecture rules caught violations I had just written
+
+`architecture.test.ts` grew two rules: desktop-host knowledge confined to
+`desktop_bridge.ts` + `app.ts`, and no `fetch`/`localStorage`/`node:` in core or
+reasoning (one deliberate exception, `state_manager/store.ts`). Both fired on my own
+code the first time they ran.
+
+That is the argument for executable invariants over documented ones. A rule in
+`docs/ARCHITECTURE.md` is read by whoever remembers to read it; a rule in the test
+suite fails the build for whoever breaks it, including the person who wrote the rule
+ten minutes earlier.
+
+A related trap: architecture tests that skip lines starting with `*` or `//` are
+defeated by prose inside a `/**` block comment. Use a block-aware `codeLines()` helper
+— otherwise a docstring mentioning `localStorage` either fails the rule or teaches you
+to weaken it.
+
+## 18. Async authority needs a token, not just a rule
+
+v0.1's invariant was "Core is the only writer". That holds synchronously. It does not
+hold when a turn is in flight: an orchestrator turn awaits a model call, the user opens
+a different idea, the turn resumes, and its changes land in the wrong idea.
+
+`StateManager.guard` is a token that changes whenever the open idea changes. The turn
+captures it *before* its first `await` and passes it with every mutation; a mismatch
+fails that turn instead of corrupting another one. Post-call abort checks and live
+body re-reads (`decideQuestion`, research questions) came from the same review.
+
+If you take one thing from this section: **in a UI where the world can change during an
+await, "who is allowed to write" must be re-checked at the write, not established at
+the start.**
+
+## 19. What v0.2 did not verify
+
+Stated plainly, because the rest of this file is only useful if this part is honest:
+
+- **No live network call was made** to Wikipedia or to Puter web search. This sandbox
+  has no route to either. Both sources are tested against injected transports with
+  hand-built payloads shaped from the *published* API contracts. A real response could
+  differ; the citation gating is designed so that a difference produces fewer findings,
+  not false ones.
+- **Three.js never rendered a frame.** No GPU here. The layout mathematics, plugin
+  registration, failure paths and teardown are tested; the pixels are not.
+- **A pywebview window was never observed opening.** No `$DISPLAY`, no PyQt6 or
+  PyGObject installed. `ideno --check`, the refusal path, the loopback server
+  (including three traversal probes), `pip install ./desktop` and `ideno --browser`
+  were all really executed. `create_window`/`start` were not.
+- **The 5 MB quota cliff was reproduced in-process**, against a store that raises the
+  same error shapes, not in a browser.
+
+Deliberately not built, and recorded as recommendations in `CHANGELOG.md` rather than
+quietly skipped: delta-encoded version snapshots, streaming for the OpenAI-compatible
+provider (needs its `FetchLike` seam widened to a readable body), and
+`.desktop`/AppImage/Flatpak packaging plus a single-instance lock.
+
+## 20. A note on this environment, for the next agent
+
+The sandbox reset between turns and wiped `node_modules/`, `/tmp/ideno-venv`, and —
+twice — the entire `.git` history by re-cloning from origin. Local commits that were
+never pushed simply ceased to exist, and the granular v0.1/v0.2 history is now
+unrecoverable; everything lives in two commits. Files in the working tree survived
+each time, so no *work* was lost, only its shape.
+
+Two practical consequences worth passing on:
+
+- **Push early.** `git push origin <branch>` after each coherent commit, not at the end.
+- **Never `npx tsc`.** It resolves and installs an unrelated package called `tsc@2.0.4`.
+  Use `./node_modules/.bin/tsc --noEmit` after `npm ci`.
+
+Also: vitest's default 5 s timeout kills performance probes (raise it explicitly for
+those), `pkill -f` can kill its own shell, and `python3 -m pip install --user` is
+blocked by PEP 668 here — use a venv.

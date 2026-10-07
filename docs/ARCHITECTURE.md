@@ -1,4 +1,4 @@
-# Ideno architecture (v0.1)
+# Ideno architecture
 
 This document records the structure, the invariants the structure exists to
 protect, and the decisions behind it — including the alternatives that were
@@ -354,17 +354,90 @@ uses, and it is labelled as scripted wherever it appears.
 
 ---
 
-## 8. What changes next, and where it lands
+## 8. What changed in v0.2, and what it actually touched
+
+The table in v0.1 predicted where each addition would land. This is what happened,
+which is worth recording because two predictions were wrong in an instructive way.
+
+| Addition | Predicted to touch | Actually touched |
+| --- | --- | --- |
+| Research source | one file, nothing else | one file per source, **plus** settings, the factory and the Settings panel. The registry seam held; the *configuration* of a source did not exist yet, and configuration is never free |
+| Three.js renderer | new plugin, "everything" untouched | new plugin **plus a new `src/render/layout.ts`**. See decision 4.9 — the renderer needed a placement pass that no renderer should own |
+| Branching versions | `state_manager` + `versioning` | that, **plus schemas** (a version needs a branch id, a snapshot had to become nullable) and the UI |
+| Streaming | provider + runtime | that, **plus** the orchestrator (a preview event), a new reasoning module, and the conversation component. The *state* contract is genuinely unchanged, which was the point of the prediction |
+| Multi-idea workspace | `WorkspaceSchema` gains `cases[]` | **wrong, and the wrongness mattered.** Nesting every idea in one document is what made saving O(all ideas) and put a hard ceiling on the workspace. v0.2 splits storage into an index plus one record per idea; see decision 4.6 |
+| Linux desktop application | not predicted | a new Python package, a new UI module, and two new architecture rules |
+
+Still open, and where each would land:
 
 | Next step | Touches | Does not touch |
 | --- | --- | --- |
-| Real research source (web/API) | one file implementing `ResearchSource`, registered by a plugin. The orchestrator already queries registered sources on a research turn, so nothing else changes | core, orchestrator, UI |
-| Three.js renderer | new plugin implementing `CanonicalRenderer` | everything |
-| Branching versions | `state_manager` + `versioning`; `parent_id` already exists | schemas |
-| Streaming responses | `AIProvider.complete` + runtime; the state contract is unchanged | core |
+| Delta-encoded snapshots | `versioning` + `state_manager` persistence | schemas, UI, reasoning |
+| Streaming for the OpenAI-compatible provider | widen its `FetchLike` seam to expose a readable body, then one adapter method | core, runtime contract |
+| `.desktop` entry / AppImage / single-instance lock | `desktop/` only | everything else |
 | Second provider | one adapter, one factory case, one enum entry | core |
 | Server-side keys | a proxy in front of `openai_compatible`; the adapter's `FetchLike` seam already allows it | core |
-| Multi-idea workspace | `WorkspaceSchema` gains `cases[]`; `StateManager` gains selection | reasoning, ai |
+
+### 4.6 Storage is an index plus one record per idea
+
+v0.1 stored the entire workspace as a single document. Two consequences were
+measured rather than predicted: saving one idea re-serialised every other, and the
+single blob crossed a browser's ~5 MB origin budget at about 170 edits — past which
+*nothing* could be saved and the only copy of the idea was the blob that would not
+fit.
+
+v0.2 writes `ideno.workspace.index.v2` (ids, titles, phase, counts) plus
+`ideno.session.v2.<id>` per idea. Listing ten ideas does not load ten ideas, and a
+corrupt idea cannot take the others with it.
+
+*Rejected alternative:* keeping one document and compressing it. Compression moves
+the ceiling; it does not remove the coupling, and it makes the stored data harder for
+a person to inspect — which matters more on the desktop, where the files are the
+product's persistence layer.
+
+### 4.7 The bridge has no policy
+
+The Python host exposes six methods that read and write named documents and report
+what happened. Deciding *what* to save, when to prune a snapshot and what a quota
+failure means stays in the TypeScript State Manager, where that logic is written once
+and tested once.
+
+*Rejected alternative:* a Python side that prunes snapshots when the disk is full. It
+would be a second authority over the same data, and the two would eventually disagree
+about which version of somebody's idea was expendable.
+
+### 4.8 A turn carries a guard
+
+`StateManager.guard` changes whenever the open idea changes. An orchestrator turn
+captures it before its first `await` and passes it with every mutation, so opening
+another idea mid-turn fails that turn instead of writing its changes into the idea
+that replaced it.
+
+This is the async equivalent of the invariant that Core is the only writer: knowing
+*who* is writing is not enough when a write can arrive after the world moved.
+
+### 4.9 Layout is not a renderer's job
+
+`src/render/layout.ts` sits between the canonical scene and any renderer, and decides
+how a named dimension maps onto an axis, where objects go, and what happens when a
+dimension is missing.
+
+The alternative — letting each renderer place objects — was rejected because a 3D view
+and a 2D diagram of the same idea would then disagree, and neither could be checked
+against the other. It also puts the placement rules somewhere they can be tested
+without a GPU, which in this project turned out to be the only place they could be
+tested at all.
+
+### 4.10 Streaming previews are decoration, structurally
+
+A streamed response is assembled in full and validated exactly as a non-streamed one.
+The partial parse that drives the preview lives in a different module
+(`reasoning/preview.ts`) from the one that decides what is written, is worded as a
+proposal ("proposing", never "added"), and is discarded when the turn ends.
+
+The structural point is that there is no code path from a partial document to the Idea
+State. A test asserts it by streaming a response whose prefix is a valid but wrong
+plan.
 
 ---
 

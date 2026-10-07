@@ -50,7 +50,7 @@ npm run dev          # http://localhost:5173
 ```
 
 ```bash
-npm test             # 320 tests, no network, no keys
+npm test             # 449 tests, no network, no keys
 npm run build        # typecheck + production bundle
 npm run typecheck
 ```
@@ -168,7 +168,7 @@ src/
 ├── reasoning/               prompts, structured context, operation preparation
 ├── research/                evidence, sources, gap analysis
 ├── render/                  Idea State → renderer-independent CanonicalScene
-├── plugins/                 extension points (no plugins ship in v0.1)
+├── plugins/                 extension points + the Three.js renderer plugin
 ├── ui/                      DOM builder, components, app shell
 └── demo/                    the scripted greenhouse scenario
 ```
@@ -206,7 +206,9 @@ nonexistent object) rather than hiding it.
 ## Security and privacy
 
 - **No backend, no secrets on a server.** The app is static. Your idea lives in
-  your browser's `localStorage` and can be exported as JSON.
+  your browser's `localStorage`, or — as a desktop application — in JSON files under
+  your XDG data directory, and can be exported either way. The Python host serves the
+  bundle over loopback and stores documents; it never sees a model call or a key.
 - **No `innerHTML` anywhere.** All text — yours and a model's — reaches the DOM
   through `textContent`. A response containing `<img onerror=…>` renders as text.
   There is a test for exactly that.
@@ -217,44 +219,72 @@ nonexistent object) rather than hiding it.
   readable by every script on the same origin.
 - **Plain `http://` endpoints are refused** unless the host is loopback, so a key
   can reach a local model server but never the open internet.
-- **Puter.js is pinned** through `package.json` and the lockfile rather than
-  loaded from an unpinned CDN script tag.
+- **Puter.js and Three.js are pinned** through `package.json` and the lockfile
+  rather than loaded from unpinned CDN script tags, and both are dynamically imported
+  so neither is downloaded unless the feature that needs it is used.
+- **The desktop host's bridge takes keys, not paths.** `window.pywebview.api` exposes
+  six methods and every one validates its key against an allowlist, refuses `.` and
+  `..`, and re-checks the resolved path is inside the workspace. Writes are atomic, so
+  a full disk or a crash mid-write leaves the previous good copy. Its HTTP server binds
+  `127.0.0.1`, serves `GET`/`HEAD` only, and re-checks every path against the served
+  root. See [`desktop/README.md`](desktop/README.md).
+- **Research sends your question to a third party, and Settings says so.** Wikipedia
+  lookups go to `en.wikipedia.org` anonymously (`origin=*`, no account, no key); Puter
+  web search goes through your Puter account. Both are switchable.
 - Model output is validated before it touches the state, ids are minted by Core,
   references that do not resolve are pruned, and claims of evidence that cite
   nothing are downgraded — with a note.
 
 ---
 
-## What v0.1 deliberately does not do
+## What Ideno deliberately does not do
 
 No autonomous background agents, no multi-agent systems, no vector database, no
-CAD or physics engine, no authentication, no plugin marketplace, no automated web
-research, no streaming. Each is either an extension point that already exists
-(`ResearchSource`, `CanonicalRenderer`, `PluginRegistry`) or out of scope until
-the core is proven.
+CAD or physics engine, no authentication, no plugin marketplace, no autonomous
+coding, no workflow designer. Each is out of scope until the core is proven — and
+the extension points that do exist (`ResearchSource`, `CanonicalRenderer`,
+`PluginRegistry`) now have real implementations behind them, which is the test of
+whether an extension point was worth having.
 
 **Known limitations, stated plainly:**
 
-- **No automated research source ships.** The pipeline is fully wired — a research
-  turn queries every registered `ResearchSource` over the highest-priority open
-  questions, converts what comes back into evidence drafts (capped, and proposed for
-  your review like anything else), and reports per-source failures — but no source is
-  registered, so nothing fetches the web yet. Until then evidence enters the state one
-  honest way at a time: **Add evidence** in the Evidence section, where you name a
-  source you actually consulted. Puter's `web_search` tool exists, but its citation
-  payload is not documented precisely enough to attribute a claim to a source, and
-  shipping a source that could not be verified would put fabricated citations into the
-  state. See [`docs/RESEARCH.md`](docs/RESEARCH.md).
+- **Automated research is gated on citations, and will often return nothing.** Two
+  sources ship — Wikipedia (on by default) and Puter web search (off by default,
+  OpenAI-routed models only). Neither records a finding without a title and a link
+  you can follow, and Puter web search additionally requires a citation whose
+  `start_index`/`end_index` span actually appears in the answer. Community reports
+  say that annotation array is frequently empty, so the honest outcome is often zero
+  findings plus a sentence saying an uncited answer is a model suggestion, not
+  research. Evidence still enters the state the manual way too: **Add evidence**,
+  where you name a source you actually consulted.
+  **Neither live service was reached during development** — this sandbox has no route
+  to them — so both are tested against injected transport, not against the real APIs.
+- **Streaming does not relax validation.** A response is assembled in full and put
+  through the same extraction, schema check and repair round-trip as before. What you
+  see while waiting is a preview labelled as a proposal; nothing is applied early.
+  The OpenAI-compatible provider does not stream at all, and falls back.
+- **The 3D view is drawn, not verified.** There is no GPU in the environment it was
+  built in, so the layout mathematics, the plugin's registration, its failure paths
+  and its teardown are tested — the pixels are not. Objects with no readable
+  dimension are drawn as small wireframe placeholders and labelled as such, because
+  guessing a size would be the same defect as guessing a citation.
 - **Puter sign-in may be blocked inside a cross-origin iframe.** Puter
   authenticates through a popup, which browsers restrict in embedded contexts.
-  If that happens, Ideno says so and offers the other two providers.
+  If that happens, Ideno says so and offers the other two providers. Running as a
+  desktop application avoids the problem entirely.
 - **A Puter request cannot be cancelled mid-flight.** Its documented `chat()`
   takes no abort signal, so Ideno races the promise: your turn stops at the
   timeout, but the upstream request may still complete and be billed.
-- **One idea at a time.** The data model is per-session and branching is designed
-  for (`parent_id`) but not implemented.
-- **Versions store full snapshots.** Correct and simple at this scale; a
-  delta-encoded history is the obvious change if workspaces grow large.
+- **Persistence cost is superlinear, though no longer fatal.** Every version stores a
+  full snapshot, so a long session costs more per change than a short one. In a browser
+  that used to mean the workspace silently stopped saving at about 170 edits; it now
+  prunes the oldest dispensable snapshots and tells you. On the desktop, where the
+  workspace is files, the ceiling disappears. Delta-encoded snapshots are the real fix
+  and are recorded as a recommendation.
+- **A desktop window has not been observed opening.** This environment has no display
+  server and no web engine installed, so `pywebview`'s `create_window`/`start` were
+  never executed. Everything before them is tested, and `ideno --check` reports
+  exactly which engine is missing.
 
 ---
 
@@ -262,7 +292,7 @@ the core is proven.
 
 ```bash
 npm run dev           # dev server on 0.0.0.0:5173
-npm test              # vitest, 14 files / 320 tests
+npm test              # vitest, 17 files / 449 tests
 npm run test:watch
 npm run typecheck     # tsc --noEmit, strict + noUncheckedIndexedAccess
 npm run build         # typecheck, then bundle to dist/

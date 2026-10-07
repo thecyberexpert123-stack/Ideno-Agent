@@ -4,7 +4,7 @@ Everything Ideno is built against that could be checked, was checked. This file
 records what was verified, how, and — just as importantly — **what could not be
 verified**, so nobody mistakes an assumption for a fact later.
 
-Verification dates: 2026-10-05.
+Verification dates: 2026-10-05 (v0.1), 2026-10-07 (v0.2 — sections 6 to 10).
 
 ---
 
@@ -166,3 +166,135 @@ labelled as scripted everywhere it appears. No claim in the script is stored wit
 
 That distinction is the reason the script exists in `src/demo/` rather than in
 `src/reasoning/`: it is sample output, not product logic.
+
+
+---
+
+## 6. Wikipedia / MediaWiki — which endpoint a browser may actually call
+
+### Sources
+
+| Source | What it was used for |
+| --- | --- |
+| <https://www.mediawiki.org/wiki/API:REST_API/Reference> (fetched) | REST search result shape: `{id, key, title, excerpt, matched_title, description, thumbnail}`; `excerpt` carries `<span class="searchmatch">` markup |
+| <https://www.mediawiki.org/wiki/API:Info> (fetched) | Action API page fields, `inprop=url` → `fullurl`/`canonicalurl`, `lastrevid`, `touched` |
+| <https://www.mediawiki.org/wiki/API:Tutorial> (fetched) | **MediaWiki's own browser example calls `/w/api.php?...&origin=*`**; parameter list incl. `generator=search`, `prop=extracts|info`, `exintro`, `explaintext`, `exsentences`, `redirects`, `formatversion=2` |
+| <https://api.wikimedia.org/wiki/API_reference/Core/Search/Search_content> (fetched) | `api.wikimedia.org` search is **scheduled for gradual deprecation from July 2026** |
+
+### What this decided
+
+- **The Action API, not REST.** `WikipediaSource` calls `/w/api.php` with `origin=*`
+  because that is the combination MediaWiki's own documentation shows being used from
+  browser JavaScript. The REST endpoints are documented with server-side examples
+  (`requests`), so using them from a browser would rest on an assumption about CORS
+  headers I could not verify.
+- **Not `api.wikimedia.org`.** Deprecation from July 2026 was read off the reference
+  itself, which is close enough to be a maintenance liability for a new dependency.
+- **Citations are permalinks.** `/wiki/<title>?oldid=<pageid>` is derived from the
+  returned `pageid`, so a finding points at the revision that was actually read rather
+  than a page that may change later.
+- **Confidence is capped at 0.45** (`MAX_SUMMARY_CONFIDENCE`), because an introductory
+  extract is a tertiary summary. It never reaches the threshold at which the orchestrator
+  would treat a claim as well-supported.
+- Extracts are cleaned with tags removed (not replaced by a space — that produced
+  `"wet ."`) and whitespace collapsed.
+
+**Not verified: a live call.** This sandbox has no route to `en.wikipedia.org`, so the
+source is tested against an injected `FetchLike`, including malformed JSON, an empty
+result set, a page with no extract and a non-2xx response.
+
+## 7. Puter `web_search` — the citation payload
+
+### Sources
+
+| Source | What it was used for |
+| --- | --- |
+| <https://docs.puter.com/AI/chat/> (fetched) | `stream`, `tools`, `normalize`; **no `response_format`**; **no abort signal**; `web_search` documented as `{model:'openai/gpt-5.6-luna', tools:[{type:'web_search'}]}` |
+| `@heyputer/puter.js@2.6.4`, `types/modules/ai/chat.d.ts` (read locally) | Streaming overload → `Promise<AsyncIterable<ChatResponseChunk>>`; `ChatResponseChunk.type` ∈ `text|reasoning|image|tool_use|compaction|extra_content|usage|error`. **`ChatMessage` has no `annotations` field.** |
+| OpenAI web-search documentation (fetched) | Chat Completions puts `message.annotations[] = {type:'url_citation', url_citation:{url,title,start_index,end_index}}`; the Responses API nests it differently |
+
+### What this decided
+
+- **Citations are read as `unknown` and validated.** Because the shipped Puter types do
+  not declare `annotations`, nothing about their shape can be assumed. `findingsFromResponse`
+  walks the value defensively and requires a citation whose `[start_index, end_index)` span
+  actually appears in the answer text (`citedSpan`). A URL that is not `http(s)`, a span that
+  does not match, or a missing title drops that citation individually rather than failing the
+  whole response.
+- **Confidence is capped at 0.6** (`MAX_WEB_SEARCH_CONFIDENCE`): a model's own annotation of
+  its own answer is weaker than a page the user can open.
+- **Off by default, and the model has to look right.** `webSearchModelLooksSupported` checks
+  the configured model before the call, because the tool is documented against OpenAI-routed
+  models only.
+- Community reports that `annotations` is frequently empty are the reason for the gating, not
+  an excuse for it: zero findings plus "this answer had no citations" is a correct result.
+
+**Not verified: a live call**, for the same reason as Wikipedia.
+
+## 8. Three.js — the one new runtime dependency
+
+### Sources
+
+| Source | What it was used for |
+| --- | --- |
+| npm registry metadata for `three@0.186.1` (fetched) | Version currency, licence (MIT), package contents |
+| `three@0.186.1` as installed (read locally: `package.json`, `build/three.module.js`, `examples/jsm/controls/OrbitControls.js`) | The actual module surface: `Scene`, `PerspectiveCamera`, `WebGLRenderer`, mesh/geometry/material classes, `OrbitControls` as a separate ESM path |
+| `@types/three@0.186.0` | **Three ships no declarations** — verified by reading the installed package's `package.json` (`types` absent) |
+
+### What this decided
+
+- **Dynamically imported, chunked, and never in the main bundle.** `createThreeRenderer`
+  takes `loadThree`/`loadControls` thunks, so the plugin registers without loading ~737 KB.
+  The production build confirms three separate chunks (`three.module-*.js` 737 KB,
+  `OrbitControls` 19.9 KB, main 312 KB).
+- **`@types/three` is a devDependency, pinned to the same minor.** Not optional: without it
+  `tsc --noEmit` under `strict` + `noUncheckedIndexedAccess` cannot check the renderer.
+- **`webglAvailable()` gates registration.** No WebGL, or a failed context, degrades to the
+  text renderer with a visible reason rather than a blank canvas.
+- Justification against the dependency-discipline rule: MIT licence, the de-facto standard for
+  browser 3D with continuous releases, no transitive runtime dependencies, and the alternative
+  (hand-rolling WebGL) is far larger and far less maintainable than the dependency it replaces.
+
+**Not verified: rendering.** There is no GPU in this environment. Tested instead: layout
+mathematics (axis assignment, diameter vs. sphere spans, missing-axis fallback, placeholder
+when no dimension exists, camera distance, grid step), plugin registration, failure paths and
+teardown (`dispose()` releases geometries, materials and the renderer).
+
+## 9. pywebview — the Linux desktop host
+
+### Sources
+
+| Source | What it was used for |
+| --- | --- |
+| `pywebview 6.2.1`, wheel unpacked and installed into a venv, then read (not prose) | `webview.start(func, args, localization, gui, debug, http_server, http_port, user_agent, private_mode, storage_path, menu, server, server_args, ssl, icon)`; `create_window(..., js_api, width, height, min_size, background_color, text_select, zoomable, confirm_close, server, http_port)`; `gui` accepts `'qt' | 'gtk'` on Linux; dispatches a **`pywebviewready`** window event when the JS bridge is live; exports `Menu` but **no `MenuItem`**; runtime deps only `bottle`, `proxy_tools`, `typing_extensions` |
+
+### What this decided
+
+- **`js_api` + `pywebviewready`, not polling.** The web layer waits for the documented event
+  before trusting `window.pywebview.api`, so a half-initialised bridge cannot be called.
+- **Engines are extras, not core dependencies.** `[qt]` = PyQt6 + PyQt6-WebEngine,
+  `[gtk]` = PyGObject. `pyproject.toml` therefore declares only `pywebview>=5.0` and leaves
+  the engine choice to the packager, which is also why `ideno --check` reports the engine
+  situation instead of guessing.
+- **No `MenuItem`.** The menu code was written against what the installed package actually
+  exports; an earlier draft imported a name that does not exist.
+- **Loopback static server, GET/HEAD only.** Verified by execution against the real server
+  object: correct MIME types, cache headers, three path-traversal probes → 404, POST and
+  DELETE → 501.
+
+**Not verified: that a window opens.** No `$DISPLAY` and no PyQt6/PyGObject in the sandbox.
+`create_window`/`start` were never executed. Everything before them — path resolution, storage,
+bridge validation, backend, CLI, build, serve — is tested (78 tests), and `ideno --browser` was
+run end to end as a real subprocess.
+
+## 10. What could not be checked, collected
+
+So that no later reader mistakes an assumption for a fact:
+
+| Item | Status |
+| --- | --- |
+| Live Wikipedia / Puter web-search responses | **Never made.** No network route from the sandbox. Both sources are tested against injected transports |
+| Three.js pixels on screen | **Never rendered.** No GPU. Layout and lifecycle tested instead |
+| A pywebview window opening on Linux | **Never observed.** No display server, no web engine installed |
+| Persistence behaviour in a real browser at the 5 MB boundary | **Measured in-process** against a store that reproduces `QuotaExceededError`/`NS_ERROR_DOM_QUOTA_REACHED`, not in a browser |
+| Streaming against a live Puter endpoint | **Never made.** Tested against a scripted async iterable matching the shipped `ChatResponseChunk` type |

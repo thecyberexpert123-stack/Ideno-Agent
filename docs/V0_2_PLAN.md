@@ -1,8 +1,10 @@
 # Ideno v0.2 — hardening pass plus the hybrid increment
 
-Status: **Part A complete; the Linux desktop host complete; Part B (B1–B5) not
-started.** `CHANGELOG.md` records what actually shipped and `docs/ARCHITECTURE.md`
-records the resulting design.
+Status: **complete.** Part A (hardening, A1–A5), Part B (B1–B5) and the Linux desktop
+host added mid-flight are all implemented, tested and documented. `CHANGELOG.md`
+records what actually shipped, including the measurements behind each fix and what was
+*not* verified; `docs/ARCHITECTURE.md` §8 records what each addition actually touched
+versus what v0.1 predicted.
 
 A requirement was added after this plan was written and is now delivered: Ideno must
 run on Linux machines as an application, with Python in the stack and a web engine as
