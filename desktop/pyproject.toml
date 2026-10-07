@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ideno-desktop"
+version = "0.2.0"
+description = "Linux desktop host for Ideno: a Python window, a web engine, and file-backed storage for the Ideno web app."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["ideno", "desktop", "pywebview", "linux"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: X11 Applications :: GTK",
+  "Environment :: X11 Applications :: Qt",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Office/Business :: Scheduling",
+]
+
+# The window itself needs a web engine, which is a platform-specific extra of
+# pywebview (PyQt6-WebEngine or PyGObject + WebKitGTK). It is deliberately not
+# pinned here: which one to install is a decision about the user's machine, and
+# getting it wrong means pulling a 200 MB Qt into a system that already has GTK.
+dependencies = [
+  "pywebview>=5.0",
+]
+
+[project.optional-dependencies]
+# Chromium engine. `pip install ".[qt]"`.
+qt = ["pywebview[qt]>=5.0"]
+# WebKitGTK engine. Needs the distribution's libwebkitgtk package as well.
+gtk = ["pywebview[gtk]>=5.0"]
+
+[project.scripts]
+ideno = "ideno_desktop.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["ideno_desktop*"]
+
+[tool.setuptools.package-data]
+ideno_desktop = ["py.typed"]
