@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+*.log
+
+# Local Ideno state store (see IDENO_DATA_DIR). Idea cases are user data and
+# must never be committed.
+data/
+
+# Local environment configuration. Never commit provider credentials.
+.env
+.env.local
+.env.*.local
+
+.DS_Store
+.vite/

@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": false,
+    "sourceMap": true,
+    "lib": ["ES2023"],
+    "types": ["node"]
+  },
+  "include": [
+    "src/core/**/*.ts",
+    "src/ai/**/*.ts",
+    "src/reasoning/**/*.ts",
+    "src/research/**/*.ts",
+    "src/plugins/**/*.ts",
+    "src/server/**/*.ts",
+    "src/shared/**/*.ts"
+  ],
+  "exclude": ["src/tests/**/*", "src/ui/**/*", "**/*.test.ts"]
+}
